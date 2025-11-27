@@ -24,6 +24,6 @@ jobs:
 
     - name: 'Build Inventory Image'
       run: |
-        docker build . --tag ghcr.io/mbenitog/store:latest
-        docker push ghcr.io/mbenitog/store:latest
+        docker build . --tag ghcr.io/mbenitog/meshtastic-site-spain:latest
+        docker push ghcr.io/mbenitog/meshtastic-site-spain:latest
 

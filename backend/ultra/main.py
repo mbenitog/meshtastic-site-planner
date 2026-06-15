@@ -9,10 +9,12 @@ from pydantic import BaseModel, Field
 
 from .geo import meter_bbox_around
 from .ign_dsm import IgnDsmClient
+from .surface import SurfaceBuilder, SurfaceMode
 
 
 app = FastAPI(title="Meshtastic Site Planner Ultra DSM Backend")
 ign = IgnDsmClient()
+surface_builder = SurfaceBuilder(dsm_client=ign)
 jobs: dict[str, dict] = {}
 
 
@@ -52,6 +54,14 @@ class UltraJobRequest(BaseModel):
     resolution_m: Literal[2.5, 5.0, 10.0, 15.0] = 2.5
 
 
+class SurfaceSampleRequest(BaseModel):
+    lat: float = Field(..., ge=-90, le=90)
+    lon: float = Field(..., ge=-180, le=180)
+    radius_m: float = Field(25.0, gt=0, le=500)
+    resolution_m: Literal[2.5] = 2.5
+    mode: SurfaceMode = "dtm_plus_buildings_2_5m"
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -79,6 +89,39 @@ def terrain_sample(request: TerrainSampleRequest) -> dict:
             "max_value": grid.max_value,
         },
         "note": "mdsn_* coverages are normalized heights above ground, not absolute RF terrain.",
+    }
+
+
+@app.post("/surface/sample")
+def surface_sample(request: SurfaceSampleRequest) -> dict:
+    try:
+        grid = surface_builder.build(
+            lat=request.lat,
+            lon=request.lon,
+            radius_m=request.radius_m,
+            resolution_m=request.resolution_m,
+            mode=request.mode,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"IGN DSM surface build failed: {exc}") from exc
+    return {
+        "mode": grid.mode,
+        "resolution_m": grid.resolution_m,
+        "bbox_25830": {
+            "min_x": grid.min_x,
+            "min_y": grid.min_y,
+            "max_x": grid.max_x,
+            "max_y": grid.max_y,
+        },
+        "grid": {
+            "width": grid.width,
+            "height": grid.height,
+            "cells": grid.width * grid.height,
+            "min_value": grid.min_value,
+            "max_value": grid.max_value,
+            "values": None,
+        },
+        "note": "2.5 m surface grid composes measured IGN DTM ground plus measured 2.5 m normalized DSM detail; no synthetic buildings are generated.",
     }
 
 

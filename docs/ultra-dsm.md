@@ -22,15 +22,13 @@ terrain.
 
 Working interpretation for ultra mode:
 
-- Use `mds05` as the first absolute surface-elevation source. This is measured
-  DSM surface data from IGN, so buildings are real source-data elevations, not
-  synthetic or simulated buildings.
-- Use `mdsn_e025` only if validation confirms it is the real 2.5 m normalized
-  building/surface detail layer for the same DSM product.
-- Use `mdsn_v025` only if validation confirms it is the real 2.5 m normalized
-  vegetation/surface detail layer and we choose to include vegetation as RF
-  obstruction.
-- Compose the RF obstruction surface from measured DSM products only. Do not
+- The active output target is a 2.5 m RF obstruction grid.
+- Use the best available measured absolute ground reference from IGN DTM.
+- Add measured 2.5 m normalized DSM heights from `mdsn_e025` to represent real
+  buildings/surface features at the highest available resolution.
+- Optionally add measured 2.5 m `mdsn_v025` vegetation heights if we decide
+  vegetation should obstruct RF at this scale.
+- Compose the RF obstruction surface from measured IGN products only. Do not
   invent, procedurally generate, or simulate building heights.
 
 ## Current Prototype
@@ -52,6 +50,14 @@ curl -X POST http://127.0.0.1:8000/terrain/sample \
   -d '{"lat":40.41696,"lon":-3.703508,"radius_m":25,"coverage_id":"mds05"}'
 ```
 
+Probe the composed 2.5 m measured surface grid:
+
+```bash
+curl -X POST http://127.0.0.1:8000/surface/sample \
+  -H 'content-type: application/json' \
+  -d '{"lat":40.41696,"lon":-3.703508,"radius_m":25,"resolution_m":2.5,"mode":"dtm_plus_buildings_2_5m"}'
+```
+
 ## Intended Backend Runner
 
 The final ultra path should:
@@ -64,6 +70,11 @@ The final ultra path should:
 5. Return GeoTIFF/COG or PNG overlay assets for the existing frontend map.
 
 The current browser engine remains limited to 90 m and 30 m terrain pages.
+
+Sparse null cells from the measured DTM reference are filled from the nearest
+valid measured neighbour in the prototype to avoid artificial zero-elevation
+holes. The production runner should keep an explicit validity mask and report
+any fallback filling in job metadata.
 
 ## Resource Scale
 

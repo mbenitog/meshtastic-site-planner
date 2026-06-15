@@ -65,11 +65,18 @@ The final ultra path should:
 1. Fetch/cache DSM chunks from IGN WCS.
 2. Build a local projected simulation grid at 2.5 m, avoiding full 1-degree
    pages.
-3. Run the native C++ RF engine against that local grid.
-4. Stream progress through an async job API.
-5. Return GeoTIFF/COG or PNG overlay assets for the existing frontend map.
+3. Materialize `surface_i16le.bin` plus `surface_meta.json` for the native
+   runner. The prototype writes signed little-endian int16 meters, row-major
+   north-to-south and west-to-east.
+4. Run the native C++ RF engine against that local grid.
+5. Stream progress through an async job API.
+6. Return GeoTIFF/COG or PNG overlay assets for the existing frontend map.
 
 The current browser engine remains limited to 90 m and 30 m terrain pages.
+The current native ultra executable is a prototype `engine/build/ultra_cli` that
+uses free-space path loss plus a measured-surface line-of-sight obstruction
+penalty. It is useful for exercising the full backend/native artifact path, but
+it is not the final ITM/Longley-Rice projected-grid model.
 
 Sparse null cells from the measured DTM reference are filled from the nearest
 valid measured neighbour in the prototype to avoid artificial zero-elevation
@@ -86,3 +93,18 @@ temporary buffers or chunk overlap. Examples:
 - 10 km radius: ~64 million cells, backend-feasible.
 - 30 km radius: ~576 million cells, requires careful chunking and disk-backed
   outputs.
+
+The prototype materializes surface grids synchronously only up to 1 million
+cells. Larger jobs are accepted but remain queued until the background tiled
+runner is implemented.
+
+Each prototype job writes these files under `.cache/ultra-jobs/<job_id>/`:
+
+- `job.json`: durable API job state.
+- `surface_i16le.bin`: measured RF obstruction surface.
+- `surface_meta.json`: projected grid dimensions, bounds, and min/max values.
+- `runner_input.json`: native runner contract containing RF parameters and
+  paths to the surface artifact.
+- `coverage.signal_i16le.bin`: prototype signal output in dBm x 10.
+- `coverage.mask_u8.bin`: prototype coverage mask.
+- `coverage.meta.json`: prototype RF output metadata.

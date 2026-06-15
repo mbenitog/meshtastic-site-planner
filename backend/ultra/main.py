@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from pathlib import Path
+import json
 from typing import Literal
 from uuid import uuid4
 
@@ -10,12 +12,33 @@ from pydantic import BaseModel, Field
 from .geo import meter_bbox_around
 from .ign_dsm import IgnDsmClient
 from .surface import SurfaceBuilder, SurfaceMode
+from .artifacts import write_surface_artifact
+from .runner import run_native_ultra, write_native_runner_input
 
 
 app = FastAPI(title="Meshtastic Site Planner Ultra DSM Backend")
 ign = IgnDsmClient()
 surface_builder = SurfaceBuilder(dsm_client=ign)
 jobs: dict[str, dict] = {}
+JOB_ROOT = Path(".cache/ultra-jobs")
+MAX_SYNC_SURFACE_CELLS = 1_000_000
+
+
+def job_dir(job_id: str) -> Path:
+    return JOB_ROOT / job_id
+
+
+def persist_job(job_id: str, job: dict) -> None:
+    out = job_dir(job_id)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "job.json").write_text(json.dumps(job, indent=2) + "\n", encoding="utf-8")
+
+
+def load_job(job_id: str) -> dict | None:
+    path = job_dir(job_id) / "job.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def estimate_grid(radius_km: float, resolution_m: float) -> dict[str, float | int]:
@@ -51,7 +74,8 @@ class UltraJobRequest(BaseModel):
     tx_gain_dbi: float = 0.0
     rx_gain_dbi: float = 0.0
     rx_sensitivity_dbm: float = -130.0
-    resolution_m: Literal[2.5, 5.0, 10.0, 15.0] = 2.5
+    resolution_m: Literal[2.5] = 2.5
+    surface_mode: SurfaceMode = "dtm_plus_buildings_2_5m"
 
 
 class SurfaceSampleRequest(BaseModel):
@@ -129,18 +153,63 @@ def surface_sample(request: SurfaceSampleRequest) -> dict:
 def create_ultra_job(request: UltraJobRequest) -> dict:
     job_id = str(uuid4())
     estimate = estimate_grid(request.radius_km, request.resolution_m)
-    jobs[job_id] = {
+    job = {
         "status": "queued",
         "request": request.model_dump(),
         "estimate": estimate,
-        "message": "Native 2.5 m DSM RF runner is not wired yet; terrain fetch prototype is available at /terrain/sample.",
+        "message": "Native 2.5 m DSM RF runner is not wired yet.",
     }
-    return {"job_id": job_id, "status": "queued", "estimate": estimate}
+    jobs[job_id] = job
+    persist_job(job_id, job)
+
+    if estimate["cells"] <= MAX_SYNC_SURFACE_CELLS:
+        job["status"] = "building_surface"
+        persist_job(job_id, job)
+        try:
+            grid = surface_builder.build(
+                lat=request.lat,
+                lon=request.lon,
+                radius_m=request.radius_km * 1000,
+                resolution_m=request.resolution_m,
+                mode=request.surface_mode,
+            )
+            artifact = write_surface_artifact(grid, job_dir(job_id))
+            runner_input = write_native_runner_input(artifact, job["request"], job_dir(job_id))
+            job["surface"] = asdict(artifact)
+            job["runner_input"] = asdict(runner_input)
+            native_result = run_native_ultra(artifact, job["request"], job_dir(job_id))
+            job["native_result"] = asdict(native_result)
+            if native_result.status == "complete":
+                job["status"] = "coverage_ready"
+                job["message"] = (
+                    "Prototype native ultra coverage is ready. Model is free-space plus LOS obstruction; "
+                    "full projected-grid ITM remains the target."
+                )
+            elif native_result.status == "missing_binary":
+                job["status"] = "surface_ready"
+                job["message"] = native_result.message
+            else:
+                job["status"] = "failed"
+                job["error"] = f"native ultra runner failed: {native_result.message}"
+        except Exception as exc:
+            job["status"] = "failed"
+            job["error"] = f"surface build failed: {exc}"
+        persist_job(job_id, job)
+    else:
+        job["status"] = "queued"
+        job["message"] = (
+            "Surface grid is too large for synchronous prototype materialization; "
+            "background tiling runner is required."
+        )
+        persist_job(job_id, job)
+
+    return {"job_id": job_id, "status": job["status"], "estimate": estimate}
 
 
 @app.get("/ultra/jobs/{job_id}")
 def get_ultra_job(job_id: str) -> dict:
-    job = jobs.get(job_id)
+    job = jobs.get(job_id) or load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
+    jobs[job_id] = job
     return job

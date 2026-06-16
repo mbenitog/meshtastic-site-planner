@@ -1,11 +1,8 @@
-/* Prototype native runner for the backend ultra DSM path.
+/* Native runner for the backend ultra DSM path.
  *
  * This intentionally does not touch the SPLAT parity CLI. It consumes the
- * projected 2.5 m surface artifact produced by backend/ultra and writes a
- * first RF raster using free-space path loss plus a terrain-obstruction
- * penalty. The output contract lets the backend exercise native execution now;
- * the propagation core can be replaced with a full projected-grid ITM runner
- * without changing the artifact boundary.
+ * projected 2.5 m surface artifact produced by backend/ultra and writes an RF
+ * raster using SPLAT!'s point_to_point_ITM model over measured terrain profiles.
  */
 
 #include <math.h>
@@ -17,6 +14,12 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+
+void point_to_point_ITM(double elev[], double tht_m, double rht_m,
+                        double eps_dielect, double sgm_conductivity,
+                        double eno_ns_surfref, double frq_mhz,
+                        int radio_climate, int pol, double conf, double rel,
+                        double &dbloss, char *strmode, int &errnum);
 
 static double arg_f(int argc, char **argv, const char *name, bool *found) {
     for (int i = 1; i + 1 < argc; i++) {
@@ -54,25 +57,48 @@ static int16_t sample_nearest(const std::vector<int16_t> &surface, int width,
     return surface[(size_t)row * (size_t)width + (size_t)col];
 }
 
-static bool obstructed(const std::vector<int16_t> &surface, int width,
-                       int height, double min_x, double max_y,
-                       double resolution, double tx_x, double tx_y,
-                       double tx_z, double rx_x, double rx_y, double rx_z) {
+static double run_itm_path(const std::vector<int16_t> &surface, int width,
+                           int height, double min_x, double max_y,
+                           double resolution, double tx_x, double tx_y,
+                           double tx_height, double rx_x, double rx_y,
+                           double rx_height, double freq, double tx_power_w,
+                           double tx_gain, double rx_gain,
+                           double eps_dielect, double conductivity,
+                           double bend, int climate, int polarization,
+                           double conf, double rel, int err_counts[6]) {
     double dx = rx_x - tx_x;
     double dy = rx_y - tx_y;
-    double dist = sqrt(dx * dx + dy * dy);
-    int steps = std::max(1, (int)floor(dist / resolution));
+    double dist = std::max(resolution, sqrt(dx * dx + dy * dy));
+    int segments = std::max(1, (int)ceil(dist / resolution));
+    std::vector<double> elev((size_t)segments + 16);
+    elev[0] = (double)segments;
+    elev[1] = dist / (double)segments;
 
-    for (int i = 1; i < steps; i++) {
-        double t = (double)i / (double)steps;
+    for (int i = 0; i <= segments; i++) {
+        double t = (double)i / (double)segments;
         double x = tx_x + dx * t;
         double y = tx_y + dy * t;
-        double los_z = tx_z + (rx_z - tx_z) * t;
-        if ((double)sample_nearest(surface, width, height, min_x, max_y,
-                                   resolution, x, y) > los_z)
-            return true;
+        elev[(size_t)i + 2] = (double)sample_nearest(surface, width, height,
+                                                     min_x, max_y, resolution,
+                                                     x, y);
     }
-    return false;
+    for (size_t i = (size_t)segments + 3; i < elev.size(); i++)
+        elev[i] = elev[(size_t)segments + 2];
+
+    double loss = 0.0;
+    char mode[100];
+    int errnum = 0;
+    point_to_point_ITM(elev.data(), tx_height, rx_height, eps_dielect,
+                       conductivity, bend, freq, climate, polarization, conf,
+                       rel, loss, mode, errnum);
+    if (errnum >= 0 && errnum < 5)
+        err_counts[errnum]++;
+    else
+        err_counts[5]++;
+
+    double erp_w = tx_power_w * pow(10.0, tx_gain / 10.0);
+    double rxp_w = erp_w / pow(10.0, (loss - 2.14) / 10.0);
+    return 10.0 * log10(rxp_w * 1000.0) + rx_gain;
 }
 
 int main(int argc, char **argv) {
@@ -109,6 +135,27 @@ int main(int argc, char **argv) {
     ok &= require(f, "--rx-gain-dbi");
     double rx_sensitivity = arg_f(argc, argv, "--rx-sensitivity-dbm", &f);
     ok &= require(f, "--rx-sensitivity-dbm");
+    double eps_dielect = arg_f(argc, argv, "--dielect", &f);
+    if (!f)
+        eps_dielect = 15.0;
+    double conductivity = arg_f(argc, argv, "--conductivity", &f);
+    if (!f)
+        conductivity = 0.005;
+    double bend = arg_f(argc, argv, "--bend", &f);
+    if (!f)
+        bend = 301.0;
+    int climate = (int)arg_f(argc, argv, "--climate", &f);
+    if (!f)
+        climate = 5;
+    int polarization = (int)arg_f(argc, argv, "--pol", &f);
+    if (!f)
+        polarization = 1;
+    double conf = arg_f(argc, argv, "--conf", &f);
+    if (!f)
+        conf = 0.95;
+    double rel = arg_f(argc, argv, "--rel", &f);
+    if (!f)
+        rel = 0.95;
     if (!ok || width <= 0 || height <= 0 || resolution <= 0 || freq <= 0 || tx_power_w <= 0)
         return 2;
 
@@ -125,29 +172,22 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    double tx_ground = (double)sample_nearest(surface, width, height, min_x, max_y,
-                                             resolution, tx_x, tx_y);
-    double tx_z = tx_ground + tx_height;
-    double tx_dbm = 10.0 * log10(tx_power_w) + 30.0 + tx_gain + rx_gain;
     std::vector<int16_t> signal(surface.size());
     std::vector<uint8_t> mask(surface.size());
     int covered = 0;
+    int err_counts[6] = {0, 0, 0, 0, 0, 0};
 
     for (int row = 0; row < height; row++) {
         double y = max_y - (double)row * resolution;
         for (int col = 0; col < width; col++) {
             double x = min_x + (double)col * resolution;
             size_t idx = (size_t)row * (size_t)width + (size_t)col;
-            double dx = x - tx_x;
-            double dy = y - tx_y;
-            double dist_m = std::max(1.0, sqrt(dx * dx + dy * dy));
-            double rx_z = (double)surface[idx] + rx_height;
-            double fspl = 32.44 + 20.0 * log10(freq) + 20.0 * log10(dist_m / 1000.0);
-            double penalty = obstructed(surface, width, height, min_x, max_y,
-                                        resolution, tx_x, tx_y, tx_z, x, y, rx_z)
-                                 ? 30.0
-                                 : 0.0;
-            double dbm = tx_dbm - fspl - penalty;
+            double dbm = run_itm_path(surface, width, height, min_x, max_y,
+                                      resolution, tx_x, tx_y, tx_height, x, y,
+                                      rx_height, freq, tx_power_w, tx_gain,
+                                      rx_gain, eps_dielect, conductivity, bend,
+                                      climate, polarization, conf, rel,
+                                      err_counts);
             int value = (int)llround(dbm * 10.0);
             signal[idx] = (int16_t)std::max(-32768, std::min(32767, value));
             mask[idx] = dbm >= rx_sensitivity ? 1 : 0;
@@ -174,7 +214,7 @@ int main(int argc, char **argv) {
         return 1;
     fprintf(fp,
             "{\n"
-            "  \"model\": \"prototype_fspl_los\",\n"
+            "  \"model\": \"itm_projected_grid\",\n"
             "  \"width\": %d,\n"
             "  \"height\": %d,\n"
             "  \"resolution_m\": %.6f,\n"
@@ -184,10 +224,12 @@ int main(int argc, char **argv) {
             "  \"mask_value\": \"1 means dbm >= rx_sensitivity_dbm\",\n"
             "  \"rx_sensitivity_dbm\": %.3f,\n"
             "  \"covered_cells\": %d,\n"
-            "  \"total_cells\": %d\n"
+            "  \"total_cells\": %d,\n"
+            "  \"itm_errnums\": [%d, %d, %d, %d, %d, %d]\n"
             "}\n",
             width, height, resolution, min_x, max_y, rx_sensitivity, covered,
-            width * height);
+            width * height, err_counts[0], err_counts[1], err_counts[2],
+            err_counts[3], err_counts[4], err_counts[5]);
     fclose(fp);
 
     fprintf(stderr, "wrote %s.{signal_i16le.bin,mask_u8.bin,meta.json}\n", out_prefix);

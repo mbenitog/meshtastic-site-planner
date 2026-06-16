@@ -7,9 +7,10 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY engine/native/ultra_main.cpp engine/native/ultra_main.cpp
+COPY splat/itwom3.0.cpp splat/itwom3.0.cpp
 RUN g++ -O2 -std=gnu++11 -w \
   -o /usr/local/bin/ultra_cli \
-  engine/native/ultra_main.cpp
+  engine/native/ultra_main.cpp splat/itwom3.0.cpp
 
 FROM python:3.12-slim
 RUN apt-get update \

@@ -12,7 +12,7 @@
       </div>
       <div class="col-span-2">
         <label for="simulation_extent" class="mt-label">Max Range (km)</label>
-        <input v-model="simulation.simulation_extent" type="number" class="mt-input" id="simulation_extent" :min="simulation.ultra_backend ? 0.02 : 1" :max="simulation.ultra_backend ? 1 : (simulation.high_resolution ? 70 : 150)" :step="simulation.ultra_backend ? 0.01 : 1" />
+        <input v-model="simulation.simulation_extent" type="number" class="mt-input" id="simulation_extent" :min="simulation.ultra_backend ? 0.02 : 1" :max="simulation.ultra_backend ? 0.25 : (simulation.high_resolution ? 70 : 150)" :step="simulation.ultra_backend ? 0.01 : 1" />
       </div>
     </div>
 
@@ -34,7 +34,7 @@
       </span>
       <span class="text-sm font-medium text-ink">Ultra backend prototype (2.5 m)</span>
     </label>
-    <p class="mt-hint mt-1">Uses the FastAPI backend and measured IGN DSM artifacts. Current prototype is limited to about 1 km radius and uses FSPL + LOS obstruction, not final ITM.</p>
+    <p class="mt-hint mt-1">Uses the FastAPI backend, measured IGN DSM artifacts, and projected-grid ITM. Direct synchronous runs are currently limited to 250 m radius until tiled execution lands.</p>
 
     <div v-if="simulation.ultra_backend" class="mt-3">
       <label for="ultra_backend_url" class="mt-label">Ultra backend URL</label>
@@ -51,7 +51,7 @@ const simulation = useStore().splatParams.simulation;
 watch(
   () => simulation.ultra_backend,
   (enabled) => {
-    if (enabled && simulation.simulation_extent > 1) simulation.simulation_extent = 1;
+    if (enabled && simulation.simulation_extent > 0.25) simulation.simulation_extent = 0.25;
     if (!enabled && simulation.simulation_extent < 1) simulation.simulation_extent = 1;
   }
 );

@@ -24,6 +24,13 @@ class NativeRunnerInput:
     rx_height_m: float
     rx_gain_dbi: float
     rx_sensitivity_dbm: float
+    ground_dielectric: float
+    ground_conductivity: float
+    atmosphere_bending: float
+    radio_climate: int
+    polarization: int
+    confidence: float
+    reliability: float
 
 
 @dataclass(frozen=True)
@@ -56,6 +63,13 @@ def write_native_runner_input(
         rx_height_m=request["rx_height_m"],
         rx_gain_dbi=request["rx_gain_dbi"],
         rx_sensitivity_dbm=request["rx_sensitivity_dbm"],
+        ground_dielectric=request["ground_dielectric"],
+        ground_conductivity=request["ground_conductivity"],
+        atmosphere_bending=request["atmosphere_bending"],
+        radio_climate=request["radio_climate"],
+        polarization=request["polarization"],
+        confidence=request["confidence"],
+        reliability=request["reliability"],
     )
     path = out / "runner_input.json"
     path.write_text(json.dumps(asdict(runner_input), indent=2) + "\n", encoding="utf-8")
@@ -71,7 +85,7 @@ def run_native_ultra(
     if not binary.exists():
         return NativeRunResult(
             status="missing_binary",
-            model="prototype_fspl_los",
+            model="itm_projected_grid",
             message=f"native ultra runner not found at {binary}; run engine/build_native.sh",
         )
 
@@ -113,19 +127,33 @@ def run_native_ultra(
         str(request["rx_gain_dbi"]),
         "--rx-sensitivity-dbm",
         str(request["rx_sensitivity_dbm"]),
+        "--dielect",
+        str(request["ground_dielectric"]),
+        "--conductivity",
+        str(request["ground_conductivity"]),
+        "--bend",
+        str(request["atmosphere_bending"]),
+        "--climate",
+        str(request["radio_climate"]),
+        "--pol",
+        str(request["polarization"]),
+        "--conf",
+        str(request["confidence"]),
+        "--rel",
+        str(request["reliability"]),
     ]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120)
     except subprocess.CalledProcessError as exc:
         return NativeRunResult(
             status="failed",
-            model="prototype_fspl_los",
+            model="itm_projected_grid",
             message=(exc.stderr or exc.stdout or str(exc)).strip(),
         )
 
     return NativeRunResult(
         status="complete",
-        model="prototype_fspl_los",
+        model="itm_projected_grid",
         signal_path=str(out_prefix) + ".signal_i16le.bin",
         mask_path=str(out_prefix) + ".mask_u8.bin",
         meta_path=str(out_prefix) + ".meta.json",

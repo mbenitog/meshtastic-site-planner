@@ -13,5 +13,5 @@ else
 fi
 clang++ -O2 -std=gnu++11 -w \
   -o engine/build/ultra_cli \
-  engine/native/ultra_main.cpp
+  engine/native/ultra_main.cpp splat/itwom3.0.cpp
 echo "built engine/build/ultra_cli"

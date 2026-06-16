@@ -36,9 +36,11 @@ Working interpretation for ultra mode:
 Run locally:
 
 ```bash
+git submodule update --init splat
 python3 -m venv .venv-ultra
 . .venv-ultra/bin/activate
 pip install -r backend/requirements-ultra.txt
+bash engine/build_native.sh
 uvicorn backend.ultra.main:app --reload
 ```
 
@@ -78,7 +80,7 @@ curl -X POST http://127.0.0.1:8000/surface/sample \
   -d '{"lat":40.41696,"lon":-3.703508,"radius_m":25,"resolution_m":2.5,"mode":"dtm_plus_buildings_2_5m"}'
 ```
 
-Create a prototype ultra job and download output artifacts:
+Create an ultra ITM job and download output artifacts:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/ultra/jobs \
@@ -110,10 +112,9 @@ The final ultra path should:
 6. Return GeoTIFF/COG or PNG overlay assets for the existing frontend map.
 
 The current browser engine remains limited to 90 m and 30 m terrain pages.
-The current native ultra executable is a prototype `engine/build/ultra_cli` that
-uses free-space path loss plus a measured-surface line-of-sight obstruction
-penalty. It is useful for exercising the full backend/native artifact path, but
-it is not the final ITM/Longley-Rice projected-grid model.
+The current native ultra executable is `engine/build/ultra_cli`. It uses
+SPLAT!'s `point_to_point_ITM` Longley-Rice implementation over measured 2.5 m
+projected-grid terrain profiles.
 
 Sparse null cells from the measured DTM reference are filled from the nearest
 valid measured neighbour in the prototype to avoid artificial zero-elevation
@@ -131,9 +132,9 @@ temporary buffers or chunk overlap. Examples:
 - 30 km radius: ~576 million cells, requires careful chunking and disk-backed
   outputs.
 
-The prototype materializes surface grids synchronously only up to 1 million
-cells. Larger jobs are accepted but remain queued until the background tiled
-runner is implemented.
+The current direct ITM runner materializes and computes jobs synchronously only
+up to 100,000 cells. Larger jobs are accepted but remain queued until the
+background tiled runner is implemented.
 
 Each prototype job writes these files under `.cache/ultra-jobs/<job_id>/`:
 

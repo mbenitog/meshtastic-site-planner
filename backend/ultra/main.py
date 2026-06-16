@@ -29,7 +29,7 @@ ign = IgnDsmClient()
 surface_builder = SurfaceBuilder(dsm_client=ign)
 jobs: dict[str, dict] = {}
 JOB_ROOT = Path(".cache/ultra-jobs")
-MAX_SYNC_SURFACE_CELLS = 1_000_000
+MAX_SYNC_SURFACE_CELLS = 100_000
 ArtifactName = Literal[
     "job",
     "surface",
@@ -113,6 +113,13 @@ class UltraJobRequest(BaseModel):
     tx_gain_dbi: float = 0.0
     rx_gain_dbi: float = 0.0
     rx_sensitivity_dbm: float = -130.0
+    ground_dielectric: float = 15.0
+    ground_conductivity: float = 0.005
+    atmosphere_bending: float = 301.0
+    radio_climate: int = Field(5, ge=1, le=7)
+    polarization: int = Field(1, ge=0, le=1)
+    confidence: float = Field(0.95, gt=0, le=1)
+    reliability: float = Field(0.95, gt=0, le=1)
     resolution_m: Literal[2.5] = 2.5
     surface_mode: SurfaceMode = "dtm_plus_buildings_2_5m"
 
@@ -221,8 +228,7 @@ def create_ultra_job(request: UltraJobRequest) -> dict:
             if native_result.status == "complete":
                 job["status"] = "coverage_ready"
                 job["message"] = (
-                    "Prototype native ultra coverage is ready. Model is free-space plus LOS obstruction; "
-                    "full projected-grid ITM remains the target."
+                    "Native ultra coverage is ready. Model is ITM/Longley-Rice over the measured projected 2.5 m surface grid."
                 )
             elif native_result.status == "missing_binary":
                 job["status"] = "surface_ready"
@@ -237,8 +243,8 @@ def create_ultra_job(request: UltraJobRequest) -> dict:
     else:
         job["status"] = "queued"
         job["message"] = (
-            "Surface grid is too large for synchronous prototype materialization; "
-            "background tiling runner is required."
+            "Surface grid is too large for synchronous direct ITM materialization; "
+            "background tiled execution is required."
         )
         persist_job(job_id, job)
 

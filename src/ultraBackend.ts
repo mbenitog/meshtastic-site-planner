@@ -21,6 +21,21 @@ interface UltraCoverageMeta {
   model: string;
 }
 
+const RADIO_CLIMATE: Record<string, number> = {
+  equatorial: 1,
+  continental_subtropical: 2,
+  maritime_subtropical: 3,
+  desert: 4,
+  continental_temperate: 5,
+  maritime_temperate_over_land: 6,
+  maritime_temperate_over_sea: 7,
+};
+
+const POLARIZATION: Record<string, number> = {
+  horizontal: 0,
+  vertical: 1,
+};
+
 function joinUrl(base: string, path: string): string {
   return `${base.replace(/\/$/, '')}${path}`;
 }
@@ -68,6 +83,13 @@ export async function runUltraBackend(
       tx_gain_dbi: params.transmitter.tx_gain,
       rx_gain_dbi: params.receiver.rx_gain,
       rx_sensitivity_dbm: params.receiver.rx_sensitivity,
+      ground_dielectric: params.environment.ground_dielectric,
+      ground_conductivity: params.environment.ground_conductivity,
+      atmosphere_bending: params.environment.atmosphere_bending,
+      radio_climate: RADIO_CLIMATE[params.environment.radio_climate] ?? 5,
+      polarization: POLARIZATION[params.environment.polarization] ?? 1,
+      confidence: params.simulation.situation_fraction / 100,
+      reliability: params.simulation.time_fraction / 100,
       resolution_m: 2.5,
       surface_mode: 'dtm_plus_buildings_2_5m',
     }),
@@ -75,7 +97,7 @@ export async function runUltraBackend(
 
   const state = await readJson<UltraJobState>(joinUrl(baseUrl, `/ultra/jobs/${job.job_id}`), { signal });
   if (state.status !== 'coverage_ready') {
-    throw new Error(`Ultra backend job ${state.status}. Prototype synchronous jobs are limited to about 1 km radius.`);
+    throw new Error(`Ultra backend job ${state.status}. Direct synchronous ITM jobs are limited to about 250 m radius.`);
   }
 
   const metaUrl = state.artifact_urls.coverage_meta;

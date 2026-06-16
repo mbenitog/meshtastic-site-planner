@@ -13,6 +13,18 @@ services:
     networks:
       - app-network
 
+  ultra-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.ultra
+    ports:
+      - 8000:8000
+    volumes:
+      - ultra-cache:/app/.cache
+    restart: unless-stopped
+    networks:
+      - app-network
+
   nginx-proxy:
     image: nginxproxy/nginx-proxy
     container_name: nginx-proxy
@@ -55,3 +67,4 @@ volumes:
   html:
   certs:
   acme:
+  ultra-cache:

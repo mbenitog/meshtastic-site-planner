@@ -52,6 +52,16 @@ docker run --rm -p 18081:8000 meshtastic-site-spain-ultra:local
 The main `Dockerfile` remains the static frontend/nginx image. `Dockerfile.ultra`
 is only for the FastAPI ultra DSM backend and bundles `/usr/local/bin/ultra_cli`.
 
+Run the frontend and backend through Compose:
+
+```bash
+docker compose up --build app ultra-backend
+```
+
+The static frontend is exposed on `http://127.0.0.1:8080`; the ultra backend is
+exposed on `http://127.0.0.1:8000`. Job/cache artifacts persist in the
+`ultra-cache` Docker volume.
+
 Probe Madrid DSM data:
 
 ```bash

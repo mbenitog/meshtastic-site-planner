@@ -93,6 +93,7 @@ curl -o coverage.meta.json http://127.0.0.1:8000/ultra/jobs/<job_id>/artifacts/c
 curl -o coverage.signal_i16le.bin http://127.0.0.1:8000/ultra/jobs/<job_id>/artifacts/coverage_signal
 curl -o coverage.mask_u8.bin http://127.0.0.1:8000/ultra/jobs/<job_id>/artifacts/coverage_mask
 curl -o coverage.png http://127.0.0.1:8000/ultra/jobs/<job_id>/artifacts/coverage_png
+curl -o coverage.pgw http://127.0.0.1:8000/ultra/jobs/<job_id>/artifacts/coverage_world
 ```
 
 Job responses include `artifact_urls` for browser clients. CORS is currently
@@ -154,3 +155,4 @@ Each prototype job writes these files under `.cache/ultra-jobs/<job_id>/`:
 - `coverage.meta.json`: prototype RF output metadata.
 - `coverage.png`: browser-ready transparent coverage overlay rendered by the
   backend from the ITM signal grid.
+- `coverage.pgw`: world file for `coverage.png`.

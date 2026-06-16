@@ -63,3 +63,30 @@ def write_coverage_png(
     path = Path(out_path)
     path.write_bytes(bytes(png))
     return str(path)
+
+
+def write_png_world_file(
+    *,
+    out_path: str | Path,
+    width: int,
+    height: int,
+    bounds_wgs84: dict[str, float],
+) -> str:
+    west = bounds_wgs84["west"]
+    east = bounds_wgs84["east"]
+    north = bounds_wgs84["north"]
+    south = bounds_wgs84["south"]
+    pixel_x = (east - west) / width
+    pixel_y = (south - north) / height
+    # World files store center coordinates of the upper-left pixel.
+    text = (
+        f"{pixel_x:.12f}\n"
+        "0.000000000000\n"
+        "0.000000000000\n"
+        f"{pixel_y:.12f}\n"
+        f"{west + pixel_x / 2:.12f}\n"
+        f"{north + pixel_y / 2:.12f}\n"
+    )
+    path = Path(out_path)
+    path.write_text(text, encoding="utf-8")
+    return str(path)

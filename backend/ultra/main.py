@@ -16,7 +16,7 @@ from .ign_dsm import IgnDsmClient
 from .surface import SurfaceBuilder, SurfaceMode
 from .artifacts import write_surface_artifact
 from .runner import run_native_ultra, write_native_runner_input
-from .render import write_coverage_png
+from .render import write_coverage_png, write_png_world_file
 
 
 app = FastAPI(title="Meshtastic Site Planner Ultra DSM Backend")
@@ -40,6 +40,7 @@ ArtifactName = Literal[
     "coverage_mask",
     "coverage_meta",
     "coverage_png",
+    "coverage_world",
 ]
 ARTIFACT_FILES: dict[str, tuple[str, str]] = {
     "job": ("job.json", "application/json"),
@@ -50,6 +51,7 @@ ARTIFACT_FILES: dict[str, tuple[str, str]] = {
     "coverage_mask": ("coverage.mask_u8.bin", "application/octet-stream"),
     "coverage_meta": ("coverage.meta.json", "application/json"),
     "coverage_png": ("coverage.png", "image/png"),
+    "coverage_world": ("coverage.pgw", "text/plain"),
 }
 
 
@@ -124,7 +126,13 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
                 height=artifact.height,
                 min_dbm=request.rx_sensitivity_dbm,
             )
-            job["coverage_png"] = {"path": png_path}
+            world_path = write_png_world_file(
+                out_path=job_dir(job_id) / "coverage.pgw",
+                width=artifact.width,
+                height=artifact.height,
+                bounds_wgs84=artifact.bounds_wgs84,
+            )
+            job["coverage_png"] = {"path": png_path, "world_path": world_path}
             job["status"] = "coverage_ready"
             set_progress(job, "finalize", 1.0)
             job["message"] = (

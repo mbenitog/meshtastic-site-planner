@@ -14,6 +14,7 @@ export interface Site {
     /** Optional backend artifacts for ultra runs. */
     artifacts?: {
         coveragePngUrl?: string;
+        coverageWorldUrl?: string;
         coverageMetaUrl?: string;
     };
 }

@@ -34,6 +34,7 @@ interface UltraSurfaceMeta {
 export interface UltraBackendResult extends CoverageResult {
   artifacts: {
     coveragePngUrl?: string;
+    coverageWorldUrl?: string;
     coverageMetaUrl?: string;
   };
 }
@@ -182,6 +183,7 @@ export async function runUltraBackend(
     },
     artifacts: {
       coveragePngUrl: state.artifact_urls.coverage_png ? joinUrl(baseUrl, state.artifact_urls.coverage_png) : undefined,
+      coverageWorldUrl: state.artifact_urls.coverage_world ? joinUrl(baseUrl, state.artifact_urls.coverage_world) : undefined,
       coverageMetaUrl: joinUrl(baseUrl, metaUrl),
     },
   };

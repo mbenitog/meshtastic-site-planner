@@ -132,6 +132,14 @@ function buildSitePopup(site: Site): HTMLElement {
     link.textContent = 'Ultra PNG';
     row?.appendChild(link);
   }
+  if (site.artifacts?.coverageWorldUrl) {
+    const row = el.querySelector('.mt-popup-export');
+    const link = document.createElement('a');
+    link.href = site.artifacts.coverageWorldUrl;
+    link.download = `${site.params.transmitter.name.replace(/[^a-z0-9_-]+/gi, '_')}-ultra-coverage.pgw`;
+    link.textContent = 'PGW';
+    row?.appendChild(link);
+  }
   return el;
 }
 

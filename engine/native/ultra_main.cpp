@@ -70,40 +70,49 @@ static int16_t sample_nearest(const std::vector<int16_t> &surface, int width,
     return surface[(size_t)row * (size_t)width + (size_t)col];
 }
 
+static inline int clamp_i(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+struct ItmScratch {
+    std::vector<double> elev;
+    char mode[100];
+};
+
 static double run_itm_path(const std::vector<int16_t> &surface, int width,
-                           int height, double min_x, double max_y,
-                           double resolution, double tx_x, double tx_y,
-                           double tx_height, double rx_x, double rx_y,
+                           int height, double resolution,
+                           int tx_col, int tx_row,
+                           double tx_height, int rx_col, int rx_row,
                            double rx_height, double freq, double tx_power_w,
                            double tx_gain, double rx_gain,
                            double eps_dielect, double conductivity,
                            double bend, int climate, int polarization,
-                           double conf, double rel, int err_counts[6]) {
-    double dx = rx_x - tx_x;
-    double dy = rx_y - tx_y;
-    double dist = std::max(resolution, sqrt(dx * dx + dy * dy));
-    int segments = std::max(1, (int)ceil(dist / resolution));
-    std::vector<double> elev((size_t)segments + 16);
-    elev[0] = (double)segments;
-    elev[1] = dist / (double)segments;
+                           double conf, double rel, int err_counts[6],
+                           ItmScratch &scratch) {
+    int dx_cells = rx_col - tx_col;
+    int dy_cells = rx_row - tx_row;
+    double dist_cells = std::sqrt((double)dx_cells * (double)dx_cells +
+                                  (double)dy_cells * (double)dy_cells);
+    double dist = std::max(resolution, dist_cells * resolution);
+    int segments = std::max(1, (int)ceil(dist_cells));
+    scratch.elev.resize((size_t)segments + 16);
+    scratch.elev[0] = (double)segments;
+    scratch.elev[1] = dist / (double)segments;
 
     for (int i = 0; i <= segments; i++) {
         double t = (double)i / (double)segments;
-        double x = tx_x + dx * t;
-        double y = tx_y + dy * t;
-        elev[(size_t)i + 2] = (double)sample_nearest(surface, width, height,
-                                                     min_x, max_y, resolution,
-                                                     x, y);
+        int col = clamp_i((int)llround((double)tx_col + (double)dx_cells * t), 0, width - 1);
+        int row = clamp_i((int)llround((double)tx_row + (double)dy_cells * t), 0, height - 1);
+        scratch.elev[(size_t)i + 2] = (double)surface[(size_t)row * (size_t)width + (size_t)col];
     }
-    for (size_t i = (size_t)segments + 3; i < elev.size(); i++)
-        elev[i] = elev[(size_t)segments + 2];
+    for (size_t i = (size_t)segments + 3; i < scratch.elev.size(); i++)
+        scratch.elev[i] = scratch.elev[(size_t)segments + 2];
 
     double loss = 0.0;
-    char mode[100];
     int errnum = 0;
-    point_to_point_ITM(elev.data(), tx_height, rx_height, eps_dielect,
+    point_to_point_ITM(scratch.elev.data(), tx_height, rx_height, eps_dielect,
                        conductivity, bend, freq, climate, polarization, conf,
-                       rel, loss, mode, errnum);
+                       rel, loss, scratch.mode, errnum);
     if (errnum >= 0 && errnum < 5)
         err_counts[errnum]++;
     else
@@ -200,18 +209,19 @@ int main(int argc, char **argv) {
     std::vector<uint8_t> mask(surface.size());
     int covered = 0;
     int err_counts[6] = {0, 0, 0, 0, 0, 0};
+    int tx_col = clamp_i((int)llround((tx_x - min_x) / resolution), 0, width - 1);
+    int tx_row = clamp_i((int)llround((max_y - tx_y) / resolution), 0, height - 1);
+    ItmScratch scratch;
 
     for (int row = tile_y0; row < tile_y0 + tile_h; row++) {
-        double y = max_y - (double)row * resolution;
         for (int col = tile_x0; col < tile_x0 + tile_w; col++) {
-            double x = min_x + (double)col * resolution;
             size_t idx = (size_t)row * (size_t)width + (size_t)col;
-            double dbm = run_itm_path(surface, width, height, min_x, max_y,
-                                      resolution, tx_x, tx_y, tx_height, x, y,
+            double dbm = run_itm_path(surface, width, height, resolution,
+                                      tx_col, tx_row, tx_height, col, row,
                                       rx_height, freq, tx_power_w, tx_gain,
                                       rx_gain, eps_dielect, conductivity, bend,
                                       climate, polarization, conf, rel,
-                                      err_counts);
+                                      err_counts, scratch);
             int value = (int)llround(dbm * 10.0);
             signal[idx] = (int16_t)std::max(-32768, std::min(32767, value));
             mask[idx] = dbm >= rx_sensitivity ? 1 : 0;

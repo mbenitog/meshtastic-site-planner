@@ -7,6 +7,8 @@ from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .geo import meter_bbox_around
@@ -17,11 +19,35 @@ from .runner import run_native_ultra, write_native_runner_input
 
 
 app = FastAPI(title="Meshtastic Site Planner Ultra DSM Backend")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 ign = IgnDsmClient()
 surface_builder = SurfaceBuilder(dsm_client=ign)
 jobs: dict[str, dict] = {}
 JOB_ROOT = Path(".cache/ultra-jobs")
 MAX_SYNC_SURFACE_CELLS = 1_000_000
+ArtifactName = Literal[
+    "job",
+    "surface",
+    "surface_meta",
+    "runner_input",
+    "coverage_signal",
+    "coverage_mask",
+    "coverage_meta",
+]
+ARTIFACT_FILES: dict[str, tuple[str, str]] = {
+    "job": ("job.json", "application/json"),
+    "surface": ("surface_i16le.bin", "application/octet-stream"),
+    "surface_meta": ("surface_meta.json", "application/json"),
+    "runner_input": ("runner_input.json", "application/json"),
+    "coverage_signal": ("coverage.signal_i16le.bin", "application/octet-stream"),
+    "coverage_mask": ("coverage.mask_u8.bin", "application/octet-stream"),
+    "coverage_meta": ("coverage.meta.json", "application/json"),
+}
 
 
 def job_dir(job_id: str) -> Path:
@@ -39,6 +65,19 @@ def load_job(job_id: str) -> dict | None:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def artifact_urls(job_id: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    base = job_dir(job_id)
+    for name, (filename, _) in ARTIFACT_FILES.items():
+        if (base / filename).exists():
+            out[name] = f"/ultra/jobs/{job_id}/artifacts/{name}"
+    return out
+
+
+def public_job(job_id: str, job: dict) -> dict:
+    return job | {"artifact_urls": artifact_urls(job_id)}
 
 
 def estimate_grid(radius_km: float, resolution_m: float) -> dict[str, float | int]:
@@ -203,7 +242,7 @@ def create_ultra_job(request: UltraJobRequest) -> dict:
         )
         persist_job(job_id, job)
 
-    return {"job_id": job_id, "status": job["status"], "estimate": estimate}
+    return {"job_id": job_id, "status": job["status"], "estimate": estimate, "artifact_urls": artifact_urls(job_id)}
 
 
 @app.get("/ultra/jobs/{job_id}")
@@ -212,4 +251,16 @@ def get_ultra_job(job_id: str) -> dict:
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     jobs[job_id] = job
-    return job
+    return public_job(job_id, job)
+
+
+@app.get("/ultra/jobs/{job_id}/artifacts/{artifact}")
+def get_ultra_artifact(job_id: str, artifact: ArtifactName) -> FileResponse:
+    job = jobs.get(job_id) or load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    filename, media_type = ARTIFACT_FILES[artifact]
+    path = job_dir(job_id) / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="artifact not found")
+    return FileResponse(path, media_type=media_type, filename=filename)

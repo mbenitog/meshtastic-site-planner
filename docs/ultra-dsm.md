@@ -78,6 +78,23 @@ curl -X POST http://127.0.0.1:8000/surface/sample \
   -d '{"lat":40.41696,"lon":-3.703508,"radius_m":25,"resolution_m":2.5,"mode":"dtm_plus_buildings_2_5m"}'
 ```
 
+Create a prototype ultra job and download output artifacts:
+
+```bash
+curl -X POST http://127.0.0.1:8000/ultra/jobs \
+  -H 'content-type: application/json' \
+  -d '{"lat":40.41696,"lon":-3.703508,"radius_km":0.02,"frequency_mhz":869.525,"tx_height_m":2,"rx_height_m":1,"tx_power_w":0.15,"tx_gain_dbi":3,"rx_gain_dbi":3,"rx_sensitivity_dbm":-130,"resolution_m":2.5}'
+
+curl http://127.0.0.1:8000/ultra/jobs/<job_id>
+curl -o coverage.meta.json http://127.0.0.1:8000/ultra/jobs/<job_id>/artifacts/coverage_meta
+curl -o coverage.signal_i16le.bin http://127.0.0.1:8000/ultra/jobs/<job_id>/artifacts/coverage_signal
+curl -o coverage.mask_u8.bin http://127.0.0.1:8000/ultra/jobs/<job_id>/artifacts/coverage_mask
+```
+
+Job responses include `artifact_urls` for browser clients. CORS is currently
+permissive for the prototype so the static frontend on port `8080` can call a
+backend on port `8000`.
+
 ## Intended Backend Runner
 
 The final ultra path should:

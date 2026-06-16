@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -75,6 +76,17 @@ static inline int clamp_i(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+static int gcd_i(int a, int b) {
+    a = abs(a);
+    b = abs(b);
+    while (b != 0) {
+        int t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
 struct ItmScratch {
     std::vector<double> elev;
     char mode[100];
@@ -86,34 +98,25 @@ struct WorkerState {
     int covered = 0;
 };
 
+struct RayTarget {
+    int col;
+    int row;
+    int multiple; /* gcd(|dx|, |dy|) from tx cell */
+};
+
 static double run_itm_path(const std::vector<int16_t> &surface, int width,
-                           int height, double resolution,
-                           int tx_col, int tx_row,
-                           double tx_height, int rx_col, int rx_row,
+                           int height, double sample_spacing_m,
+                           int segments,
+                           double tx_height,
                            double rx_height, double freq, double tx_power_w,
                            double tx_gain, double rx_gain,
                            double eps_dielect, double conductivity,
                            double bend, int climate, int polarization,
                            double conf, double rel, int err_counts[6],
                            ItmScratch &scratch) {
-    int dx_cells = rx_col - tx_col;
-    int dy_cells = rx_row - tx_row;
-    double dist_cells = std::sqrt((double)dx_cells * (double)dx_cells +
-                                  (double)dy_cells * (double)dy_cells);
-    double dist = std::max(resolution, dist_cells * resolution);
-    int segments = std::max(1, (int)ceil(dist_cells));
     scratch.elev.resize((size_t)segments + 16);
     scratch.elev[0] = (double)segments;
-    scratch.elev[1] = dist / (double)segments;
-
-    for (int i = 0; i <= segments; i++) {
-        double t = (double)i / (double)segments;
-        int col = clamp_i((int)llround((double)tx_col + (double)dx_cells * t), 0, width - 1);
-        int row = clamp_i((int)llround((double)tx_row + (double)dy_cells * t), 0, height - 1);
-        scratch.elev[(size_t)i + 2] = (double)surface[(size_t)row * (size_t)width + (size_t)col];
-    }
-    for (size_t i = (size_t)segments + 3; i < scratch.elev.size(); i++)
-        scratch.elev[i] = scratch.elev[(size_t)segments + 2];
+    scratch.elev[1] = sample_spacing_m;
 
     double loss = 0.0;
     int errnum = 0;
@@ -226,17 +229,69 @@ int main(int argc, char **argv) {
     worker_count = std::max(1, std::min(worker_count, tile_h));
     worker_count = std::min(worker_count, 8);
 
+    std::map<std::pair<int, int>, std::vector<RayTarget>> groups;
+    for (int row = tile_y0; row < tile_y0 + tile_h; row++) {
+        for (int col = tile_x0; col < tile_x0 + tile_w; col++) {
+            int dx = col - tx_col;
+            int dy = row - tx_row;
+            size_t idx = (size_t)row * (size_t)width + (size_t)col;
+            if (dx == 0 && dy == 0) {
+                double tx_dbm = 10.0 * log10(tx_power_w * 1000.0) + tx_gain + rx_gain;
+                int value = (int)llround(tx_dbm * 10.0);
+                signal[idx] = (int16_t)std::max(-32768, std::min(32767, value));
+                mask[idx] = tx_dbm >= rx_sensitivity ? 1 : 0;
+                if (mask[idx])
+                    covered++;
+                continue;
+            }
+            int g = gcd_i(dx, dy);
+            if (g <= 0)
+                g = 1;
+            groups[{dx / g, dy / g}].push_back({col, row, g});
+        }
+    }
+    std::vector<std::pair<std::pair<int, int>, std::vector<RayTarget>>> group_list;
+    group_list.reserve(groups.size());
+    for (auto &entry : groups)
+        group_list.push_back(entry);
+
     std::vector<WorkerState> states((size_t)worker_count);
     std::vector<std::thread> workers;
     workers.reserve((size_t)worker_count);
 
-    auto run_rows = [&](int worker_index) {
+    auto run_groups = [&](int worker_index) {
         WorkerState &state = states[(size_t)worker_index];
-        for (int row = tile_y0 + worker_index; row < tile_y0 + tile_h; row += worker_count) {
-            for (int col = tile_x0; col < tile_x0 + tile_w; col++) {
-                size_t idx = (size_t)row * (size_t)width + (size_t)col;
-                double dbm = run_itm_path(surface, width, height, resolution,
-                                          tx_col, tx_row, tx_height, col, row,
+        for (size_t gi = (size_t)worker_index; gi < group_list.size(); gi += (size_t)worker_count) {
+            auto &group = group_list[gi];
+            int step_col = group.first.first;
+            int step_row = group.first.second;
+            auto &targets = group.second;
+            std::sort(targets.begin(), targets.end(), [](const RayTarget &a, const RayTarget &b) {
+                return a.multiple < b.multiple;
+            });
+            int base_segments = std::max(abs(step_col), abs(step_row));
+            double sample_spacing_m = resolution * std::sqrt((double)step_col * (double)step_col +
+                                                             (double)step_row * (double)step_row) /
+                                      (double)base_segments;
+            int built_segments = 0;
+            state.scratch.elev.resize(16);
+            state.scratch.elev[2] = (double)surface[(size_t)tx_row * (size_t)width + (size_t)tx_col];
+            for (const RayTarget &target : targets) {
+                int segments = target.multiple * base_segments;
+                state.scratch.elev.resize((size_t)segments + 16);
+                for (int s = built_segments + 1; s <= segments; s++) {
+                    double t = (double)s / (double)base_segments;
+                    int col = clamp_i((int)llround((double)tx_col + (double)step_col * t), 0, width - 1);
+                    int row = clamp_i((int)llround((double)tx_row + (double)step_row * t), 0, height - 1);
+                    state.scratch.elev[(size_t)s + 2] = (double)surface[(size_t)row * (size_t)width + (size_t)col];
+                }
+                for (size_t pad = (size_t)segments + 3; pad < state.scratch.elev.size(); pad++)
+                    state.scratch.elev[pad] = state.scratch.elev[(size_t)segments + 2];
+                built_segments = segments;
+
+                size_t idx = (size_t)target.row * (size_t)width + (size_t)target.col;
+                double dbm = run_itm_path(surface, width, height, sample_spacing_m,
+                                          segments, tx_height,
                                           rx_height, freq, tx_power_w, tx_gain,
                                           rx_gain, eps_dielect, conductivity, bend,
                                           climate, polarization, conf, rel,
@@ -251,7 +306,7 @@ int main(int argc, char **argv) {
     };
 
     for (int i = 0; i < worker_count; i++)
-        workers.push_back(std::thread(run_rows, i));
+        workers.push_back(std::thread(run_groups, i));
     for (std::thread &worker : workers)
         worker.join();
 

@@ -1,0 +1,73 @@
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from backend.ultra.main import app
+
+
+client = TestClient(app)
+
+
+def test_health():
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
+def test_terrain_sample_rejects_unknown_coverage():
+    r = client.post(
+        "/terrain/sample",
+        json={"lat": 40.4, "lon": -3.7, "radius_m": 50, "coverage_id": "nope"},
+    )
+    assert r.status_code == 422
+
+
+def test_artifact_endpoint_whitelist():
+    r = client.get("/ultra/jobs/unknown-id/artifacts/coverage_signal")
+    assert r.status_code == 404
+    r = client.get("/ultra/jobs/unknown-id/artifacts/not_allowed")
+    assert r.status_code == 422
+
+
+def test_create_ultra_job_returns_artifact_urls():
+    r = client.post(
+        "/ultra/jobs",
+        json={
+            "lat": 40.4,
+            "lon": -3.7,
+            "radius_km": 0.05,
+            "frequency_mhz": 869.525,
+            "tx_height_m": 2,
+            "rx_height_m": 1,
+            "tx_power_w": 0.15,
+            "tx_gain_dbi": 3,
+            "rx_gain_dbi": 3,
+            "rx_sensitivity_dbm": -130,
+            "resolution_m": 2.5,
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "queued"
+    assert "job_id" in body
+    assert body["progress"]["phase"] == "terrain"
+
+
+def test_ultra_job_request_rejects_bad_radius():
+    r = client.post(
+        "/ultra/jobs",
+        json={
+            "lat": 40.4,
+            "lon": -3.7,
+            "radius_km": 100,  # > 30 limit
+            "frequency_mhz": 869.525,
+            "tx_height_m": 2,
+            "rx_height_m": 1,
+            "tx_power_w": 0.15,
+            "tx_gain_dbi": 3,
+            "rx_gain_dbi": 3,
+            "rx_sensitivity_dbm": -130,
+            "resolution_m": 2.5,
+        },
+    )
+    assert r.status_code == 422

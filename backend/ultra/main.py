@@ -83,12 +83,17 @@ def public_job(job_id: str, job: dict) -> dict:
     return job | {"artifact_urls": artifact_urls(job_id)}
 
 
+def set_progress(job: dict, phase: str, fraction: float) -> None:
+    job["progress"] = {"phase": phase, "fraction": max(0.0, min(1.0, fraction))}
+
+
 def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
     job = jobs.get(job_id) or load_job(job_id)
     if not job:
         return
     job["status"] = "building_surface"
     job["message"] = "Building measured 2.5 m surface grid."
+    set_progress(job, "terrain", 0.1)
     jobs[job_id] = job
     persist_job(job_id, job)
     try:
@@ -105,6 +110,7 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
         job["runner_input"] = asdict(runner_input)
         job["status"] = "running_native"
         job["message"] = "Running ITM/Longley-Rice over measured projected-grid terrain."
+        set_progress(job, "compute", 0.5)
         persist_job(job_id, job)
 
         native_result = run_native_ultra(artifact, job["request"], job_dir(job_id))
@@ -120,17 +126,21 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
             )
             job["coverage_png"] = {"path": png_path}
             job["status"] = "coverage_ready"
+            set_progress(job, "finalize", 1.0)
             job["message"] = (
                 "Native ultra coverage is ready. Model is ITM/Longley-Rice over the measured projected 2.5 m surface grid."
             )
         elif native_result.status == "missing_binary":
             job["status"] = "surface_ready"
+            set_progress(job, "finalize", 0.75)
             job["message"] = native_result.message
         else:
             job["status"] = "failed"
+            set_progress(job, "finalize", 1.0)
             job["error"] = f"native ultra runner failed: {native_result.message}"
     except Exception as exc:
         job["status"] = "failed"
+        set_progress(job, "finalize", 1.0)
         job["error"] = f"surface build failed: {exc}"
     jobs[job_id] = job
     persist_job(job_id, job)
@@ -261,15 +271,18 @@ def create_ultra_job(request: UltraJobRequest, background_tasks: BackgroundTasks
         "estimate": estimate,
         "message": "Native 2.5 m DSM RF runner is not wired yet.",
     }
+    set_progress(job, "terrain", 0.0)
     jobs[job_id] = job
     persist_job(job_id, job)
 
     if estimate["cells"] <= MAX_SYNC_SURFACE_CELLS:
         job["message"] = "Queued for direct projected-grid ITM execution."
+        set_progress(job, "terrain", 0.02)
         persist_job(job_id, job)
         background_tasks.add_task(run_ultra_job, job_id, request)
     else:
         job["status"] = "queued"
+        set_progress(job, "terrain", 0.0)
         job["message"] = (
             "Surface grid is too large for synchronous direct ITM materialization; "
             "background tiled execution is required."
@@ -280,6 +293,7 @@ def create_ultra_job(request: UltraJobRequest, background_tasks: BackgroundTasks
         "job_id": job_id,
         "status": job["status"],
         "message": job["message"],
+        "progress": job["progress"],
         "estimate": estimate,
         "artifact_urls": artifact_urls(job_id),
     }

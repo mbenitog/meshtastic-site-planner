@@ -852,7 +852,9 @@ const useStore = defineStore('store', {
         console.log('Coverage request:', request);
 
         const result = this.splatParams.simulation.ultra_backend
-          ? await runUltraBackend(this.splatParams, abortController.signal)
+          ? await runUltraBackend(this.splatParams, abortController.signal, (p) => {
+              this.progress = p;
+            })
           : await (await getEngine()).run(params, {
               terrain: getTerrain(),
               signal: abortController.signal,

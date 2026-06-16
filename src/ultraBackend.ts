@@ -1,10 +1,16 @@
-import type { CoverageResult } from './engine/CoverageEngine';
+import type { CoverageProgress, CoverageResult } from './engine/CoverageEngine';
 import type { SplatParams } from './types';
 
 interface UltraJobResponse {
   job_id: string;
   status: string;
   artifact_urls: Record<string, string>;
+  progress?: UltraProgress;
+}
+
+interface UltraProgress {
+  phase: CoverageProgress['phase'];
+  fraction: number;
 }
 
 interface UltraJobState extends UltraJobResponse {
@@ -70,10 +76,22 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-async function waitForUltraJob(baseUrl: string, jobId: string, signal?: AbortSignal): Promise<UltraJobState> {
+function emitProgress(progress: UltraProgress | undefined, onProgress?: (p: CoverageProgress) => void): void {
+  if (!progress || !onProgress) return;
+  const fraction = Math.max(0, Math.min(1, progress.fraction));
+  onProgress({ phase: progress.phase, completed: Math.round(fraction * 100), total: 100, fraction });
+}
+
+async function waitForUltraJob(
+  baseUrl: string,
+  jobId: string,
+  signal?: AbortSignal,
+  onProgress?: (p: CoverageProgress) => void
+): Promise<UltraJobState> {
   const deadline = Date.now() + 10 * 60 * 1000;
   while (Date.now() < deadline) {
     const state = await readJson<UltraJobState>(joinUrl(baseUrl, `/ultra/jobs/${jobId}`), { signal });
+    emitProgress(state.progress, onProgress);
     if (state.status === 'coverage_ready' || state.status === 'failed' || state.status === 'surface_ready') {
       return state;
     }
@@ -84,7 +102,8 @@ async function waitForUltraJob(baseUrl: string, jobId: string, signal?: AbortSig
 
 export async function runUltraBackend(
   params: SplatParams,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onProgress?: (p: CoverageProgress) => void
 ): Promise<CoverageResult> {
   const baseUrl = params.simulation.ultra_backend_url || 'http://127.0.0.1:8000';
   const job = await readJson<UltraJobResponse>(joinUrl(baseUrl, '/ultra/jobs'), {
@@ -113,8 +132,9 @@ export async function runUltraBackend(
       surface_mode: 'dtm_plus_buildings_2_5m',
     }),
   });
+  emitProgress(job.progress, onProgress);
 
-  const state = await waitForUltraJob(baseUrl, job.job_id, signal);
+  const state = await waitForUltraJob(baseUrl, job.job_id, signal, onProgress);
   if (state.status !== 'coverage_ready') {
     throw new Error(`Ultra backend job ${state.status}. Direct synchronous ITM jobs are limited to about 250 m radius.`);
   }

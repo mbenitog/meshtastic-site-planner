@@ -99,6 +99,9 @@ Job responses include `artifact_urls` for browser clients. CORS is currently
 permissive for the prototype so the static frontend on port `8080` can call a
 backend on port `8000`.
 
+Job responses include a coarse `progress` object with `phase` values matching
+the frontend progress UI: `terrain`, `compute`, and `finalize`.
+
 ## Intended Backend Runner
 
 The final ultra path should:

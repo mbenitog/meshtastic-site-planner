@@ -200,6 +200,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
     # helper still owns the final aggregation step.
     import os
     import subprocess
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from pathlib import Path
 
     binary = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli")).resolve()
@@ -219,7 +220,25 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
 
     tx_x, tx_y = latlon_to_utm30(request["lat"], request["lon"])
     total = len(tiles)
+    workers = min(
+        max(1, int(os.environ.get("ULTRA_TILE_WORKERS", max(1, (os.cpu_count() or 1) // 2)))),
+        max(1, len(tiles)),
+        4,
+    )
+    job = jobs.get(job_id)
+    if job is not None:
+        job.setdefault("tiles", {})["workers"] = workers
+        persist_job(job_id, job)
+
+    pending_tiles = []
     for tile in tiles:
+        sig_path = out_dir / f"coverage_x{tile.x0}_y{tile.y0}.signal_i16le.bin"
+        if sig_path.exists():
+            _advance_tile_progress(job_id, total)
+        else:
+            pending_tiles.append(tile)
+
+    for batch_start in range(0, len(pending_tiles), workers):
         if is_cancel_requested(job_id):
             from .runner import NativeRunResult
             return NativeRunResult(
@@ -227,23 +246,27 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                 model="itm_projected_grid",
                 message="Ultra job cancelled during tiled native execution.",
             )
-        sig_path = out_dir / f"coverage_x{tile.x0}_y{tile.y0}.signal_i16le.bin"
-        if sig_path.exists():
-            _advance_tile_progress(job_id, total)
-            continue
-        cmd = _build_cmd(binary, artifact, tile, request, tx_x, tx_y, out_prefix)
-        try:
-            subprocess.run(
-                cmd, check=True, capture_output=True, text=True, timeout=600
-            )
-        except Exception as exc:
-            from .runner import NativeRunResult
-            return NativeRunResult(
-                status="failed",
-                model="itm_projected_grid",
-                message=f"tile ({tile.x0},{tile.y0}) failed: {exc}",
-            )
-        _advance_tile_progress(job_id, total)
+        batch = pending_tiles[batch_start : batch_start + workers]
+
+        def run_tile(tile):
+            cmd = _build_cmd(binary, artifact, tile, request, tx_x, tx_y, out_prefix)
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+            return tile
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(run_tile, tile): tile for tile in batch}
+            for future in as_completed(future_map):
+                tile = future_map[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    from .runner import NativeRunResult
+                    return NativeRunResult(
+                        status="failed",
+                        model="itm_projected_grid",
+                        message=f"tile ({tile.x0},{tile.y0}) failed: {exc}",
+                    )
+                _advance_tile_progress(job_id, total)
 
     # Aggregation step is the same as the helper.
     return run_tiled_native_ultra(

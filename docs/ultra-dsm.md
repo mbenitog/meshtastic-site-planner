@@ -156,9 +156,11 @@ temporary buffers or chunk overlap. Examples:
 
 The backend runs every supported job in the background through the FastAPI
 `BackgroundTasks` worker. Jobs are split into ~250 000-cell tiles which the
-native ITM runner executes sequentially, persisting per-tile signal/mask
-files and aggregating them into the final coverage output. Resume after a
-restart is supported because tiles that already produced a file are skipped.
+native ITM runner executes in small parallel batches (up to 4 workers by
+default, configurable with `ULTRA_TILE_WORKERS`), persisting per-tile
+signal/mask files and aggregating them into the final coverage output.
+Resume after a restart is supported because tiles that already produced a file
+are skipped.
 
 A 1 km radius around Madrid (641 601 cells, 4 tiles) typically finishes in
 under a minute on a single core. Radii beyond the local IGN coverage area

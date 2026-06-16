@@ -274,7 +274,7 @@ class UltraJobRequest(BaseModel):
     confidence: float = Field(0.95, gt=0, le=1)
     reliability: float = Field(0.95, gt=0, le=1)
     resolution_m: Literal[2.5] = 2.5
-    surface_mode: SurfaceMode = "dtm_plus_buildings_2_5m"
+    surface_mode: SurfaceMode = "lod_dtm_plus_buildings"
 
 
 class SurfaceSampleRequest(BaseModel):
@@ -312,6 +312,54 @@ def terrain_sample(request: TerrainSampleRequest) -> dict:
             "max_value": grid.max_value,
         },
         "note": "mdsn_* coverages are normalized heights above ground, not absolute RF terrain.",
+    }
+
+
+class CoverageProbeRequest(BaseModel):
+    lat: float = Field(..., ge=-90, le=90)
+    lon: float = Field(..., ge=-180, le=180)
+    radius_m: float = Field(..., gt=0, le=10000)
+
+
+@app.post("/coverage/probe")
+def coverage_probe(request: CoverageProbeRequest) -> dict:
+    """Return which IGN coverage layers are available for the bbox so the UI
+    can pick a surface mode before submitting a job."""
+    min_x, min_y, max_x, max_y = meter_bbox_around(request.lat, request.lon, request.radius_m)
+    availability: dict[str, dict] = {}
+    for coverage_id in ("mds05", "mdsn_v025", "mdsn_e025"):
+        try:
+            grid = ign.fetch_arcgrid(
+                coverage_id=coverage_id,
+                min_x=min_x,
+                min_y=min_y,
+                max_x=max_x,
+                max_y=max_y,
+            )
+            availability[coverage_id] = {
+                "available": True,
+                "ncols": grid.ncols,
+                "nrows": grid.nrows,
+                "min_value": grid.min_value,
+                "max_value": grid.max_value,
+            }
+        except Exception as exc:
+            availability[coverage_id] = {
+                "available": False,
+                "error": str(exc),
+            }
+    mdsn_e025 = availability.get("mdsn_e025", {}).get("available", False)
+    mdsn_v025 = availability.get("mdsn_v025", {}).get("available", False)
+    mds05 = availability.get("mds05", {}).get("available", False)
+    recommended = (
+        "lod_dtm_plus_buildings"
+        if mdsn_e025 or mds05
+        else "dtm_only"
+    )
+    return {
+        "bbox_25830": {"min_x": min_x, "min_y": min_y, "max_x": max_x, "max_y": max_y},
+        "availability": availability,
+        "recommended_surface_mode": recommended,
     }
 
 

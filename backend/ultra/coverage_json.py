@@ -145,3 +145,99 @@ class CoverageApiClient:
             text = result.stdout.decode("utf-8")
         cache_path.write_text(text, encoding="utf-8")
         return parse_coverage_json(text)
+
+    def fetch_grid_tiled(
+        self,
+        *,
+        collection_id: str,
+        min_x: float,
+        min_y: float,
+        max_x: float,
+        max_y: float,
+        max_cells_per_request: int = 250_000,
+        timeout: float = 120.0,
+    ) -> CoverageGrid:
+        """Fetch a bbox by splitting it into several sub-requests. The DTM
+        coverage at 5 m cells typically allows ~225 cells per side, so
+        large radii would otherwise be rejected by the API."""
+        width_m = max_x - min_x
+        height_m = max_y - min_y
+        cell_size = 5.0
+        cells_x = int(width_m / cell_size) + 1
+        cells_y = int(height_m / cell_size) + 1
+        if cells_x * cells_y <= max_cells_per_request:
+            return self.fetch_grid(
+                collection_id=collection_id,
+                min_x=min_x,
+                min_y=min_y,
+                max_x=max_x,
+                max_y=max_y,
+                timeout=timeout,
+            )
+        stride_cells = int((max_cells_per_request) ** 0.5)
+        stride_m = stride_cells * cell_size
+        tiles: list[CoverageGrid] = []
+        x = min_x
+        while x < max_x - 1e-6:
+            tile_max_x = min(x + stride_m, max_x)
+            y = min_y
+            while y < max_y - 1e-6:
+                tile_max_y = min(y + stride_m, max_y)
+                tiles.append(
+                    self.fetch_grid(
+                        collection_id=collection_id,
+                        min_x=x,
+                        min_y=y,
+                        max_x=tile_max_x,
+                        max_y=tile_max_y,
+                        timeout=timeout,
+                    )
+                )
+                y = tile_max_y
+            x = tile_max_x
+        return stitch_coverage_grids(tiles, min_x, min_y, max_x, max_y, cell_size)
+
+
+def stitch_coverage_grids(
+    tiles: list[CoverageGrid],
+    min_x: float,
+    min_y: float,
+    max_x: float,
+    max_y: float,
+    cell_size: float,
+) -> CoverageGrid:
+    """Stitch per-tile CoverageGrids into a single grid covering
+    [min_x,max_x) x [min_y,max_y) at the requested cell size."""
+    ncols = max(1, int(round((max_x - min_x) / cell_size)))
+    nrows = max(1, int(round((max_y - min_y) / cell_size)))
+    values: list[float | None] = [None] * (ncols * nrows)
+    for tile in tiles:
+        if tile.width <= 0 or tile.height <= 0:
+            continue
+        tile_dx = tile.dx
+        tile_dy = tile.dy
+        if tile_dx == 0 or tile_dy == 0:
+            continue
+        for r in range(tile.height):
+            src_y = tile.max_y - (r + 0.5) * tile_dy
+            dst_row = int(round((max_y - src_y) / cell_size - 0.5))
+            if dst_row < 0 or dst_row >= nrows:
+                continue
+            for c in range(tile.width):
+                src_x = tile.min_x + (c + 0.5) * tile_dx
+                dst_col = int(round((src_x - min_x) / cell_size - 0.5))
+                if dst_col < 0 or dst_col >= ncols:
+                    continue
+                values[dst_row * ncols + dst_col] = tile.values[r * tile.width + c]
+    cleaned: list[float] = []
+    for v in values:
+        cleaned.append(0.0 if v is None else v)
+    return CoverageGrid(
+        width=ncols,
+        height=nrows,
+        min_x=min_x,
+        max_x=max_x,
+        min_y=min_y,
+        max_y=max_y,
+        values=cleaned,
+    )

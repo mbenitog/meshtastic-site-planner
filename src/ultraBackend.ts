@@ -21,14 +21,56 @@ interface UltraJobState extends UltraJobResponse {
   };
 }
 
+export type UltraSurfaceMode =
+  | 'lod_dtm_plus_buildings'
+  | 'dtm_plus_buildings_2_5m'
+  | 'dtm_plus_surface_2_5m'
+  | 'dtm_only';
+
 interface UltraCoverageMeta {
   width: number;
   height: number;
   model: string;
 }
 
+interface UltraCoverageProbe {
+  availability: Record<
+    string,
+    { available: boolean; error?: string; ncols?: number; nrows?: number; min_value?: number; max_value?: number }
+  >;
+  recommended_surface_mode: UltraSurfaceMode;
+}
+
+const SURFACE_MODE_LABELS: Record<UltraSurfaceMode, string> = {
+  lod_dtm_plus_buildings: 'LOD (2.5 m detail + DTM fallback)',
+  dtm_plus_buildings_2_5m: 'Strict 2.5 m (fail if unavailable)',
+  dtm_plus_surface_2_5m: '2.5 m + vegetation (fail if unavailable)',
+  dtm_only: 'DTM 5 m only (no buildings)',
+};
+
+export function describeSurfaceMode(mode: UltraSurfaceMode): string {
+  return SURFACE_MODE_LABELS[mode] ?? mode;
+}
+
+export async function probeUltraCoverage(
+  baseUrl: string,
+  lat: number,
+  lon: number,
+  radiusMeters: number,
+  signal?: AbortSignal,
+): Promise<UltraCoverageProbe> {
+  return readJson<UltraCoverageProbe>(joinUrl(baseUrl, '/coverage/probe'), {
+    method: 'POST',
+    signal,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ lat, lon, radius_m: radiusMeters }),
+  });
+}
+
 interface UltraSurfaceMeta {
   bounds_wgs84?: CoverageResult['bounds'];
+  mode?: string;
+  source_counts?: Record<string, number>;
 }
 
 export interface UltraBackendResult extends CoverageResult {
@@ -37,6 +79,8 @@ export interface UltraBackendResult extends CoverageResult {
     coverageWorldUrl?: string;
     coverageMetaUrl?: string;
   };
+  surfaceMode?: string;
+  sourceCounts?: Record<string, number>;
 }
 
 const RADIO_CLIMATE: Record<string, number> = {
@@ -111,9 +155,11 @@ async function waitForUltraJob(
 export async function runUltraBackend(
   params: SplatParams,
   signal?: AbortSignal,
-  onProgress?: (p: CoverageProgress) => void
+  onProgress?: (p: CoverageProgress) => void,
+  options: { surfaceMode?: UltraSurfaceMode } = {},
 ): Promise<UltraBackendResult> {
   const baseUrl = params.simulation.ultra_backend_url || 'http://127.0.0.1:8000';
+  const surfaceMode: UltraSurfaceMode = options.surfaceMode ?? 'lod_dtm_plus_buildings';
   const job = await readJson<UltraJobResponse>(joinUrl(baseUrl, '/ultra/jobs'), {
     method: 'POST',
     signal,
@@ -137,14 +183,14 @@ export async function runUltraBackend(
       confidence: params.simulation.situation_fraction / 100,
       reliability: params.simulation.time_fraction / 100,
       resolution_m: 2.5,
-      surface_mode: 'dtm_plus_buildings_2_5m',
+      surface_mode: surfaceMode,
     }),
   });
   emitProgress(job.progress, onProgress);
 
   const state = await waitForUltraJob(baseUrl, job.job_id, signal, onProgress);
   if (state.status !== 'coverage_ready') {
-    throw new Error(`Ultra backend job ${state.status}. Direct synchronous ITM jobs are limited to about 250 m radius.`);
+    throw new Error(`Ultra backend job ${state.status}.`);
   }
 
   const metaUrl = state.artifact_urls.coverage_meta;
@@ -186,5 +232,7 @@ export async function runUltraBackend(
       coverageWorldUrl: state.artifact_urls.coverage_world ? joinUrl(baseUrl, state.artifact_urls.coverage_world) : undefined,
       coverageMetaUrl: joinUrl(baseUrl, metaUrl),
     },
+    surfaceMode: surfaceMeta.mode,
+    sourceCounts: surfaceMeta.source_counts,
   };
 }

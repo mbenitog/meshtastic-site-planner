@@ -21,6 +21,7 @@ class ArcGrid:
     yllcorner: float
     cellsize: float
     values: list[float]
+    nodata: float | None = None
 
     @property
     def min_value(self) -> float:
@@ -70,8 +71,9 @@ def parse_arcgrid(text: str) -> ArcGrid:
 
     ncols = int(header["ncols"])
     nrows = int(header["nrows"])
+    nodata_value = header.get("nodata_value")
     values: list[float] = []
-    nodata = header.get("nodata_value")
+    nodata = nodata_value
     for line in lines[data_start:]:
         for raw in line.split():
             value = float(raw)
@@ -86,6 +88,7 @@ def parse_arcgrid(text: str) -> ArcGrid:
         yllcorner=header["yllcorner"],
         cellsize=header["cellsize"],
         values=values,
+        nodata=nodata,
     )
 
 
@@ -148,3 +151,138 @@ class IgnDsmClient:
             text = result.stdout.decode("utf-8")
         cache_path.write_text(text, encoding="utf-8")
         return parse_arcgrid(text)
+
+    def fetch_arcgrid_tiled(
+        self,
+        *,
+        coverage_id: str,
+        min_x: float,
+        min_y: float,
+        max_x: float,
+        max_y: float,
+        max_cells_per_request: int = 1_100_000,
+        timeout: float = 120.0,
+    ) -> ArcGrid:
+        """Fetch a potentially large bbox by splitting it into several WCS
+        sub-requests and stitching the resulting ArcGrids into a single grid.
+
+        This is needed because the IGN WCS endpoint rejects bboxes that would
+        produce a response larger than about 1.2 million cells (i.e. ~3 km at
+        2.5 m resolution). The split is based on the WCS cell size for the
+        coverage (2.5 m for ``mdsn_*``, 5 m for ``mds05``). Sub-requests that
+        fall outside the available data are skipped and contribute no-data
+        cells in the stitched result, so the caller can fall back to a
+        coarser source for those cells.
+        """
+        cell_size = 2.5 if coverage_id.startswith("mdsn_") else 5.0
+        width_m = max_x - min_x
+        height_m = max_y - min_y
+        cells_x = int(width_m / cell_size) + 1
+        cells_y = int(height_m / cell_size) + 1
+        if cells_x * cells_y <= max_cells_per_request:
+            return self.fetch_arcgrid(
+                coverage_id=coverage_id,
+                min_x=min_x,
+                min_y=min_y,
+                max_x=max_x,
+                max_y=max_y,
+                timeout=timeout,
+            )
+
+        # Decide a tile size in cells. Keep the cell-size-based stride so
+        # adjacent tiles are easy to align.
+        stride_cells = int((max_cells_per_request) ** 0.5)
+        stride_m = stride_cells * cell_size
+        tiles: list[ArcGrid] = []
+        x = min_x
+        while x < max_x - 1e-6:
+            tile_max_x = min(x + stride_m, max_x)
+            y = min_y
+            while y < max_y - 1e-6:
+                tile_max_y = min(y + stride_m, max_y)
+                try:
+                    tiles.append(
+                        self.fetch_arcgrid(
+                            coverage_id=coverage_id,
+                            min_x=x,
+                            min_y=y,
+                            max_x=tile_max_x,
+                            max_y=tile_max_y,
+                            timeout=timeout,
+                        )
+                    )
+                except Exception:
+                    pass  # sub-tile outside coverage; treat as no-data
+                y = tile_max_y
+            x = tile_max_x
+        if not tiles:
+            # Fall back to a single direct call so the caller still gets an
+            # explicit exception (e.g. the bbox is entirely outside data).
+            return self.fetch_arcgrid(
+                coverage_id=coverage_id,
+                min_x=min_x,
+                min_y=min_y,
+                max_x=max_x,
+                max_y=max_y,
+                timeout=timeout,
+            )
+        return stitch_arcgrids(tiles, min_x, min_y, max_x, max_y, cell_size)
+
+
+def stitch_arcgrids(
+    tiles: list[ArcGrid],
+    min_x: float,
+    min_y: float,
+    max_x: float,
+    max_y: float,
+    cell_size: float,
+) -> ArcGrid:
+    """Stitch per-tile ArcGrids into a single grid covering [min_x,max_x) x
+    [min_y,max_y) at the requested cell size. Tiles are assumed to be
+    contiguous (or overlapping at most at the cell boundary) and aligned
+    to the same cell size."""
+    ncols = max(1, int(round((max_x - min_x) / cell_size)))
+    nrows = max(1, int(round((max_y - min_y) / cell_size)))
+    values: list[float | None] = [None] * (ncols * nrows)
+    nodata_value: float | None = None
+    for tile in tiles:
+        t_ncols = tile.ncols
+        t_nrows = tile.nrows
+        t_x0 = tile.xllcorner
+        t_y0 = tile.yllcorner
+        if t_ncols <= 0 or t_nrows <= 0:
+            continue
+        t_x1 = t_x0 + (t_ncols - 1) * tile.cellsize
+        t_y1 = t_y0 + (t_nrows - 1) * tile.cellsize
+        col0 = max(0, int(round((t_x0 - min_x) / cell_size)))
+        row0 = max(0, int(round((max_y - t_y1) / cell_size)))
+        for r in range(t_nrows):
+            src_y = t_y0 + (t_nrows - 1 - r) * tile.cellsize
+            dst_row = max(0, int(round((max_y - src_y) / cell_size)))
+            if dst_row < 0 or dst_row >= nrows:
+                continue
+            for c in range(t_ncols):
+                src_x = t_x0 + c * tile.cellsize
+                dst_col = int(round((src_x - min_x) / cell_size))
+                if dst_col < 0 or dst_col >= ncols:
+                    continue
+                value = tile.values[r * t_ncols + c]
+                values[dst_row * ncols + dst_col] = value
+                if tile.nodata is not None and value == tile.nodata:
+                    nodata_value = tile.nodata
+    cleaned: list[float] = []
+    for v in values:
+        if v is None:
+            cleaned.append(-9999.0)
+            nodata_value = -9999.0
+        else:
+            cleaned.append(v)
+    return ArcGrid(
+        ncols=ncols,
+        nrows=nrows,
+        xllcorner=min_x,
+        yllcorner=min_y,
+        cellsize=cell_size,
+        values=cleaned,
+        nodata=nodata_value,
+    )

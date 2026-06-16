@@ -17,6 +17,8 @@ export interface Site {
         coverageWorldUrl?: string;
         coverageMetaUrl?: string;
     };
+    surfaceMode?: string;
+    sourceCounts?: Record<string, number>;
 }
 export interface SplatParams {
     transmitter: {

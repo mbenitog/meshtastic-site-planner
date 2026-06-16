@@ -19,7 +19,7 @@ import { loadParams, mergeParams, saveParams } from './persist.ts';
 import { decodeSharedHash, buildShareUrl, clearSharedHash } from './permalink.ts';
 import { coverageStats } from './coverageStats.ts';
 import { TerrainService } from './terrain/TerrainService.ts';
-import { runUltraBackend } from './ultraBackend.ts';
+import { runUltraBackend, probeUltraCoverage, type UltraSurfaceMode } from './ultraBackend.ts';
 import type { UltraBackendResult } from './ultraBackend.ts';
 
 // Module-level singletons: workers, terrain cache, and map handles outlive
@@ -90,6 +90,28 @@ function getTerrain(): TerrainService {
   return terrain;
 }
 
+/** Map: backend per-cell source labels to short human-readable labels. */
+const SOURCE_LABEL: Record<string, string> = {
+  dtm_plus_mdsn_e025: '2.5 m',
+  dtm_plus_mdsn_v025: 'veg',
+  dtm_plus_mds05: '5 m',
+  dtm_only: 'DTM',
+  unknown: '?',
+};
+
+function formatSourceCounts(counts: Record<string, number>): string {
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  if (total === 0) return '—';
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(counts)) {
+    if (value === 0) continue;
+    const pct = Math.round((value / total) * 100);
+    const label = SOURCE_LABEL[key] ?? key;
+    parts.push(`${pct}% ${label}`);
+  }
+  return parts.join(' · ');
+}
+
 /** Map popup DOM for a simulated site: parameters + georeferenced export
  * buttons (#64). Built as a DOM element so the export buttons can be wired
  * directly. */
@@ -109,7 +131,7 @@ function buildSitePopup(site: Site): HTMLElement {
     <div class="mt-popup-row"><span>Plot radius</span><span>${site.params.simulation.simulation_extent} km</span></div>
     <div class="mt-popup-row"><span>Coverage (≥ ${s.thresholdDbm} dBm)</span><span>${km2} km²</span></div>
     <div class="mt-popup-row"><span>Max usable range</span><span>${s.maxRangeKm.toFixed(1)} km</span></div>
-    <div class="mt-popup-row"><span>Disk covered</span><span>${Math.round(s.coveredFraction * 100)}%</span></div>
+    <div class="mt-popup-row"><span>Disk covered</span><span>${Math.round(s.coveredFraction * 100)}%</span></div>${site.surfaceMode ? `<div class="mt-popup-row"><span>Surface mode</span><span>${esc(site.surfaceMode)}</span></div>${site.sourceCounts ? `<div class="mt-popup-row"><span>2.5 m detail</span><span>${formatSourceCounts(site.sourceCounts)}</span></div>` : ''}` : ''}
     <div class="mt-popup-export">
       <span>Export</span>
       <button type="button" data-fmt="geojson">GeoJSON</button>
@@ -869,9 +891,26 @@ const useStore = defineStore('store', {
         console.log('Coverage request:', request);
 
         const result = this.splatParams.simulation.ultra_backend
-          ? await runUltraBackend(this.splatParams, abortController.signal, (p) => {
-              this.progress = p;
-            })
+          ? await (async () => {
+              const baseUrl = this.splatParams.simulation.ultra_backend_url || 'http://127.0.0.1:8000';
+              let surfaceMode: UltraSurfaceMode = 'lod_dtm_plus_buildings';
+              try {
+                const probe = await probeUltraCoverage(
+                  baseUrl,
+                  this.splatParams.transmitter.tx_lat,
+                  this.splatParams.transmitter.tx_lon,
+                  this.splatParams.simulation.simulation_extent * 1000,
+                  abortController.signal,
+                );
+                surfaceMode = probe.recommended_surface_mode;
+                console.log('Ultra surface mode probe:', probe.availability, '->', surfaceMode);
+              } catch (probeErr) {
+                console.warn('Ultra coverage probe failed, falling back to LOD mode:', probeErr);
+              }
+              return runUltraBackend(this.splatParams, abortController.signal, (p) => {
+                this.progress = p;
+              }, { surfaceMode });
+            })()
           : await (await getEngine()).run(params, {
               terrain: getTerrain(),
               signal: abortController.signal,
@@ -902,6 +941,8 @@ const useStore = defineStore('store', {
           visible: true,
           stats,
           artifacts: this.splatParams.simulation.ultra_backend ? (result as UltraBackendResult).artifacts : undefined,
+          surfaceMode: this.splatParams.simulation.ultra_backend ? (result as UltraBackendResult).surfaceMode : undefined,
+          sourceCounts: this.splatParams.simulation.ultra_backend ? (result as UltraBackendResult).sourceCounts : undefined,
         };
         this.localSites.push(site);
 

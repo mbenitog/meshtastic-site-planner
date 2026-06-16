@@ -183,7 +183,8 @@ body {
   margin-right: auto;
 }
 
-.mt-popup-export button {
+.mt-popup-export button,
+.mt-popup-export a {
   background: var(--mt-surface-container-highest);
   color: var(--mt-on-surface);
   border: 1px solid var(--mt-outline-variant);
@@ -192,9 +193,11 @@ body {
   font-size: 0.75rem;
   font-weight: 600;
   cursor: pointer;
+  text-decoration: none;
 }
 
-.mt-popup-export button:hover {
+.mt-popup-export button:hover,
+.mt-popup-export a:hover {
   background: var(--mt-primary);
   color: var(--mt-on-primary);
   border-color: var(--mt-primary);

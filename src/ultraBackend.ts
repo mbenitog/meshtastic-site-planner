@@ -31,6 +31,13 @@ interface UltraSurfaceMeta {
   bounds_wgs84?: CoverageResult['bounds'];
 }
 
+export interface UltraBackendResult extends CoverageResult {
+  artifacts: {
+    coveragePngUrl?: string;
+    coverageMetaUrl?: string;
+  };
+}
+
 const RADIO_CLIMATE: Record<string, number> = {
   equatorial: 1,
   continental_subtropical: 2,
@@ -104,7 +111,7 @@ export async function runUltraBackend(
   params: SplatParams,
   signal?: AbortSignal,
   onProgress?: (p: CoverageProgress) => void
-): Promise<CoverageResult> {
+): Promise<UltraBackendResult> {
   const baseUrl = params.simulation.ultra_backend_url || 'http://127.0.0.1:8000';
   const job = await readJson<UltraJobResponse>(joinUrl(baseUrl, '/ultra/jobs'), {
     method: 'POST',
@@ -172,6 +179,10 @@ export async function runUltraBackend(
       itmWarnings: [],
       elapsedMs: 0,
       workers: 1,
+    },
+    artifacts: {
+      coveragePngUrl: state.artifact_urls.coverage_png ? joinUrl(baseUrl, state.artifact_urls.coverage_png) : undefined,
+      coverageMetaUrl: joinUrl(baseUrl, metaUrl),
     },
   };
 }

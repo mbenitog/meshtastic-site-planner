@@ -11,6 +11,11 @@ export interface Site {
     visible: boolean;
     /** Coverage area / range / fraction, computed once at simulation time. */
     stats: CoverageStats;
+    /** Optional backend artifacts for ultra runs. */
+    artifacts?: {
+        coveragePngUrl?: string;
+        coverageMetaUrl?: string;
+    };
 }
 export interface SplatParams {
     transmitter: {

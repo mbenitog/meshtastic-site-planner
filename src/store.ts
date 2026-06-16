@@ -20,6 +20,7 @@ import { decodeSharedHash, buildShareUrl, clearSharedHash } from './permalink.ts
 import { coverageStats } from './coverageStats.ts';
 import { TerrainService } from './terrain/TerrainService.ts';
 import { runUltraBackend } from './ultraBackend.ts';
+import type { UltraBackendResult } from './ultraBackend.ts';
 
 // Module-level singletons: workers, terrain cache, and map handles outlive
 // store hot-reloads and never need to be reactive.
@@ -123,6 +124,14 @@ function buildSitePopup(site: Site): HTMLElement {
       else if (fmt === 'kml') void exportKml(site);
     })
   );
+  if (site.artifacts?.coveragePngUrl) {
+    const row = el.querySelector('.mt-popup-export');
+    const link = document.createElement('a');
+    link.href = site.artifacts.coveragePngUrl;
+    link.download = `${site.params.transmitter.name.replace(/[^a-z0-9_-]+/gi, '_')}-ultra-coverage.png`;
+    link.textContent = 'Ultra PNG';
+    row?.appendChild(link);
+  }
   return el;
 }
 
@@ -878,7 +887,14 @@ const useStore = defineStore('store', {
           request.lon,
           siteParams.receiver.rx_sensitivity
         );
-        const site: Site = { params: siteParams, id, result: cropped, visible: true, stats };
+        const site: Site = {
+          params: siteParams,
+          id,
+          result: cropped,
+          visible: true,
+          stats,
+          artifacts: this.splatParams.simulation.ultra_backend ? (result as UltraBackendResult).artifacts : undefined,
+        };
         this.localSites.push(site);
 
         // The draft pin becomes a persistent, labeled site marker.

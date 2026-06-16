@@ -19,6 +19,7 @@ import { loadParams, mergeParams, saveParams } from './persist.ts';
 import { decodeSharedHash, buildShareUrl, clearSharedHash } from './permalink.ts';
 import { coverageStats } from './coverageStats.ts';
 import { TerrainService } from './terrain/TerrainService.ts';
+import { runUltraBackend } from './ultraBackend.ts';
 
 // Module-level singletons: workers, terrain cache, and map handles outlive
 // store hot-reloads and never need to be reactive.
@@ -176,6 +177,8 @@ function defaultParams(): SplatParams {
       time_fraction: 95.0,
       simulation_extent: 30.0,
       high_resolution: true,
+      ultra_backend: false,
+      ultra_backend_url: 'http://127.0.0.1:8000',
     },
     display: { color_scale: 'plasma', min_dbm: -130.0, max_dbm: -80.0, overlay_transparency: 50 },
   };
@@ -848,16 +851,20 @@ const useStore = defineStore('store', {
         const params = toEngineParams(request);
         console.log('Coverage request:', request);
 
-        const result = await (await getEngine()).run(params, {
-          terrain: getTerrain(),
-          signal: abortController.signal,
-          onProgress: (p) => {
-            this.progress = p;
-          },
-        });
+        const result = this.splatParams.simulation.ultra_backend
+          ? await runUltraBackend(this.splatParams, abortController.signal)
+          : await (await getEngine()).run(params, {
+              terrain: getTerrain(),
+              signal: abortController.signal,
+              onProgress: (p) => {
+                this.progress = p;
+              },
+            });
         console.log(
-          `Computed ${result.stats.radials} radials over ${result.stats.pages} pages ` +
-            `in ${(result.stats.elapsedMs / 1000).toFixed(1)}s using ${result.stats.workers} workers`
+          this.splatParams.simulation.ultra_backend
+            ? `Computed prototype ultra backend coverage (${result.width}x${result.height})`
+            : `Computed ${result.stats.radials} radials over ${result.stats.pages} pages ` +
+                `in ${(result.stats.elapsedMs / 1000).toFixed(1)}s using ${result.stats.workers} workers`
         );
 
         const cropped = cropToRadius(result, request.lat, request.lon, request.radius);

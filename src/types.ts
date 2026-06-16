@@ -41,6 +41,8 @@ export interface SplatParams {
         time_fraction: number;
         simulation_extent: number;
         high_resolution: boolean;
+        ultra_backend: boolean;
+        ultra_backend_url: string;
     };
     display: {
         color_scale: string;

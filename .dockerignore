@@ -1,4 +1,7 @@
 .git
+.cache
 dist
+engine/build
 node_modules
+.venv*
 .DS_Store

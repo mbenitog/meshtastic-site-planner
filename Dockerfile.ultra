@@ -1,0 +1,25 @@
+# Ultra DSM backend image: FastAPI service plus the native projected-grid
+# prototype runner. The static frontend remains in the main Dockerfile.
+
+FROM debian:bookworm-slim AS native-build
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends g++ ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY engine/native/ultra_main.cpp engine/native/ultra_main.cpp
+RUN g++ -O2 -std=gnu++11 -w \
+  -o /usr/local/bin/ultra_cli \
+  engine/native/ultra_main.cpp
+
+FROM python:3.12-slim
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends curl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY backend/requirements-ultra.txt backend/requirements-ultra.txt
+RUN pip install --no-cache-dir -r backend/requirements-ultra.txt
+COPY backend backend
+COPY --from=native-build /usr/local/bin/ultra_cli /usr/local/bin/ultra_cli
+ENV ULTRA_CLI=/usr/local/bin/ultra_cli
+EXPOSE 8000
+CMD ["uvicorn", "backend.ultra.main:app", "--host", "0.0.0.0", "--port", "8000"]

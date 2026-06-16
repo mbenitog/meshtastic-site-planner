@@ -42,6 +42,16 @@ pip install -r backend/requirements-ultra.txt
 uvicorn backend.ultra.main:app --reload
 ```
 
+Run the backend in Docker:
+
+```bash
+docker build -f Dockerfile.ultra -t meshtastic-site-spain-ultra:local .
+docker run --rm -p 18081:8000 meshtastic-site-spain-ultra:local
+```
+
+The main `Dockerfile` remains the static frontend/nginx image. `Dockerfile.ultra`
+is only for the FastAPI ultra DSM backend and bundles `/usr/local/bin/ultra_cli`.
+
 Probe Madrid DSM data:
 
 ```bash

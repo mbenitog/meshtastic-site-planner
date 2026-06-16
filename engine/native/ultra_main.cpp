@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <string>
+#include <thread>
 #include <vector>
 
 void point_to_point_ITM(double elev[], double tht_m, double rht_m,
@@ -77,6 +78,12 @@ static inline int clamp_i(int v, int lo, int hi) {
 struct ItmScratch {
     std::vector<double> elev;
     char mode[100];
+};
+
+struct WorkerState {
+    ItmScratch scratch;
+    int err_counts[6] = {0, 0, 0, 0, 0, 0};
+    int covered = 0;
 };
 
 static double run_itm_path(const std::vector<int16_t> &surface, int width,
@@ -189,6 +196,9 @@ int main(int argc, char **argv) {
     double rel = arg_f(argc, argv, "--rel", &f);
     if (!f)
         rel = 0.95;
+    int threads = arg_i(argc, argv, "--threads", &f);
+    if (!f)
+        threads = 0;
     if (!ok || width <= 0 || height <= 0 || resolution <= 0 || freq <= 0 || tx_power_w <= 0)
         return 2;
 
@@ -211,23 +221,44 @@ int main(int argc, char **argv) {
     int err_counts[6] = {0, 0, 0, 0, 0, 0};
     int tx_col = clamp_i((int)llround((tx_x - min_x) / resolution), 0, width - 1);
     int tx_row = clamp_i((int)llround((max_y - tx_y) / resolution), 0, height - 1);
-    ItmScratch scratch;
+    unsigned hw = std::thread::hardware_concurrency();
+    int worker_count = threads > 0 ? threads : (hw > 0 ? (int)hw : 1);
+    worker_count = std::max(1, std::min(worker_count, tile_h));
+    worker_count = std::min(worker_count, 8);
 
-    for (int row = tile_y0; row < tile_y0 + tile_h; row++) {
-        for (int col = tile_x0; col < tile_x0 + tile_w; col++) {
-            size_t idx = (size_t)row * (size_t)width + (size_t)col;
-            double dbm = run_itm_path(surface, width, height, resolution,
-                                      tx_col, tx_row, tx_height, col, row,
-                                      rx_height, freq, tx_power_w, tx_gain,
-                                      rx_gain, eps_dielect, conductivity, bend,
-                                      climate, polarization, conf, rel,
-                                      err_counts, scratch);
-            int value = (int)llround(dbm * 10.0);
-            signal[idx] = (int16_t)std::max(-32768, std::min(32767, value));
-            mask[idx] = dbm >= rx_sensitivity ? 1 : 0;
-            if (mask[idx])
-                covered++;
+    std::vector<WorkerState> states((size_t)worker_count);
+    std::vector<std::thread> workers;
+    workers.reserve((size_t)worker_count);
+
+    auto run_rows = [&](int worker_index) {
+        WorkerState &state = states[(size_t)worker_index];
+        for (int row = tile_y0 + worker_index; row < tile_y0 + tile_h; row += worker_count) {
+            for (int col = tile_x0; col < tile_x0 + tile_w; col++) {
+                size_t idx = (size_t)row * (size_t)width + (size_t)col;
+                double dbm = run_itm_path(surface, width, height, resolution,
+                                          tx_col, tx_row, tx_height, col, row,
+                                          rx_height, freq, tx_power_w, tx_gain,
+                                          rx_gain, eps_dielect, conductivity, bend,
+                                          climate, polarization, conf, rel,
+                                          state.err_counts, state.scratch);
+                int value = (int)llround(dbm * 10.0);
+                signal[idx] = (int16_t)std::max(-32768, std::min(32767, value));
+                mask[idx] = dbm >= rx_sensitivity ? 1 : 0;
+                if (mask[idx])
+                    state.covered++;
+            }
         }
+    };
+
+    for (int i = 0; i < worker_count; i++)
+        workers.push_back(std::thread(run_rows, i));
+    for (std::thread &worker : workers)
+        worker.join();
+
+    for (const WorkerState &state : states) {
+        covered += state.covered;
+        for (int i = 0; i < 6; i++)
+            err_counts[i] += state.err_counts[i];
     }
 
     std::string base(out_prefix);
@@ -263,6 +294,7 @@ int main(int argc, char **argv) {
             "  \"tile_y0\": %d,\n"
             "  \"tile_w\": %d,\n"
             "  \"tile_h\": %d,\n"
+            "  \"threads\": %d,\n"
             "  \"resolution_m\": %.6f,\n"
             "  \"min_x\": %.6f,\n"
             "  \"max_y\": %.6f,\n"
@@ -273,7 +305,7 @@ int main(int argc, char **argv) {
             "  \"total_cells\": %d,\n"
             "  \"itm_errnums\": [%d, %d, %d, %d, %d, %d]\n"
             "}\n",
-            width, height, tile_x0, tile_y0, tile_w, tile_h,
+            width, height, tile_x0, tile_y0, tile_w, tile_h, worker_count,
             resolution, min_x, max_y,
             rx_sensitivity, covered,
             tile_w * tile_h, err_counts[0], err_counts[1], err_counts[2],

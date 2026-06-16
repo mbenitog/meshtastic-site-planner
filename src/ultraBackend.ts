@@ -21,6 +21,10 @@ interface UltraCoverageMeta {
   model: string;
 }
 
+interface UltraSurfaceMeta {
+  bounds_wgs84?: CoverageResult['bounds'];
+}
+
 const RADIO_CLIMATE: Record<string, number> = {
   equatorial: 1,
   continental_subtropical: 2,
@@ -38,17 +42,6 @@ const POLARIZATION: Record<string, number> = {
 
 function joinUrl(base: string, path: string): string {
   return `${base.replace(/\/$/, '')}${path}`;
-}
-
-function boundsAround(lat: number, lon: number, radiusMeters: number): CoverageResult['bounds'] {
-  const deltaLat = (radiusMeters / 6378137) * (180 / Math.PI);
-  const deltaLon = deltaLat / Math.cos((lat * Math.PI) / 180);
-  return {
-    north: lat + deltaLat,
-    south: lat - deltaLat,
-    east: lon + deltaLon,
-    west: lon - deltaLon,
-  };
 }
 
 async function readJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -127,11 +120,13 @@ export async function runUltraBackend(
   }
 
   const metaUrl = state.artifact_urls.coverage_meta;
+  const surfaceMetaUrl = state.artifact_urls.surface_meta;
   const signalUrl = state.artifact_urls.coverage_signal;
-  if (!metaUrl || !signalUrl) throw new Error('Ultra backend did not return coverage artifacts');
+  if (!metaUrl || !surfaceMetaUrl || !signalUrl) throw new Error('Ultra backend did not return coverage artifacts');
 
-  const [meta, rawSignal] = await Promise.all([
+  const [meta, surfaceMeta, rawSignal] = await Promise.all([
     readJson<UltraCoverageMeta>(joinUrl(baseUrl, metaUrl), { signal }),
+    readJson<UltraSurfaceMeta>(joinUrl(baseUrl, surfaceMetaUrl), { signal }),
     readArrayBuffer(joinUrl(baseUrl, signalUrl), signal),
   ]);
   const values = new Int16Array(rawSignal);
@@ -142,7 +137,8 @@ export async function runUltraBackend(
   const dbm = new Float32Array(values.length);
   for (let i = 0; i < values.length; i++) dbm[i] = values[i] / 10;
 
-  const bounds = boundsAround(state.request.lat, state.request.lon, state.request.radius_km * 1000);
+  const bounds = surfaceMeta.bounds_wgs84;
+  if (!bounds) throw new Error('Ultra backend did not return WGS84 surface bounds');
   return {
     dbm,
     width: meta.width,

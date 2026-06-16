@@ -50,6 +50,46 @@ def latlon_to_utm30(lat_deg: float, lon_deg: float) -> tuple[float, float]:
     return x, y
 
 
+def utm30_to_latlon(x: float, y: float) -> tuple[float, float]:
+    """Convert EPSG:25830-like UTM zone 30N meters to WGS84 lon-lat."""
+    a = 6378137.0
+    f = 1 / 298.257223563
+    k0 = 0.9996
+    e2 = f * (2 - f)
+    ep2 = e2 / (1 - e2)
+    lon0 = math.radians(-3.0)
+
+    m = y / k0
+    mu = m / (a * (1 - e2 / 4 - 3 * e2**2 / 64 - 5 * e2**3 / 256))
+    e1 = (1 - math.sqrt(1 - e2)) / (1 + math.sqrt(1 - e2))
+    j1 = 3 * e1 / 2 - 27 * e1**3 / 32
+    j2 = 21 * e1**2 / 16 - 55 * e1**4 / 32
+    j3 = 151 * e1**3 / 96
+    j4 = 1097 * e1**4 / 512
+    fp = mu + j1 * math.sin(2 * mu) + j2 * math.sin(4 * mu) + j3 * math.sin(6 * mu) + j4 * math.sin(8 * mu)
+
+    sin_fp = math.sin(fp)
+    cos_fp = math.cos(fp)
+    tan_fp = math.tan(fp)
+    c1 = ep2 * cos_fp * cos_fp
+    t1 = tan_fp * tan_fp
+    n1 = a / math.sqrt(1 - e2 * sin_fp * sin_fp)
+    r1 = a * (1 - e2) / (1 - e2 * sin_fp * sin_fp) ** 1.5
+    d = (x - 500000) / (n1 * k0)
+
+    lat = fp - (n1 * tan_fp / r1) * (
+        d**2 / 2
+        - (5 + 3 * t1 + 10 * c1 - 4 * c1**2 - 9 * ep2) * d**4 / 24
+        + (61 + 90 * t1 + 298 * c1 + 45 * t1**2 - 252 * ep2 - 3 * c1**2) * d**6 / 720
+    )
+    lon = lon0 + (
+        d
+        - (1 + 2 * t1 + c1) * d**3 / 6
+        + (5 - 2 * c1 + 28 * t1 - 3 * c1**2 + 8 * ep2 + 24 * t1**2) * d**5 / 120
+    ) / cos_fp
+    return math.degrees(lat), math.degrees(lon)
+
+
 def meter_bbox_around(lat: float, lon: float, radius_m: float) -> tuple[float, float, float, float]:
     x, y = latlon_to_utm30(lat, lon)
     return x - radius_m, y - radius_m, x + radius_m, y + radius_m

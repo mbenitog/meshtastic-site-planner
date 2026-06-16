@@ -142,6 +142,7 @@ Each prototype job writes these files under `.cache/ultra-jobs/<job_id>/`:
 - `job.json`: durable API job state.
 - `surface_i16le.bin`: measured RF obstruction surface.
 - `surface_meta.json`: projected grid dimensions, bounds, and min/max values.
+  It also includes `bounds_wgs84` for browser overlay georeferencing.
 - `runner_input.json`: native runner contract containing RF parameters and
   paths to the surface artifact.
 - `coverage.signal_i16le.bin`: prototype signal output in dBm x 10.

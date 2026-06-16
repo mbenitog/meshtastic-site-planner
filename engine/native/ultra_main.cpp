@@ -47,6 +47,19 @@ static bool require(bool found, const char *name) {
     return found;
 }
 
+static int arg_i(int argc, char **argv, const char *name, bool *found) {
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], name) == 0) {
+            if (found)
+                *found = true;
+            return (int)atof(argv[i + 1]);
+        }
+    }
+    if (found)
+        *found = false;
+    return 0;
+}
+
 static int16_t sample_nearest(const std::vector<int16_t> &surface, int width,
                               int height, double min_x, double max_y,
                               double resolution, double x, double y) {
@@ -111,6 +124,17 @@ int main(int argc, char **argv) {
     ok &= require(f, "--width");
     int height = (int)arg_f(argc, argv, "--height", &f);
     ok &= require(f, "--height");
+    int tile_x0 = arg_i(argc, argv, "--tile-x0", &f);
+    int tile_y0 = arg_i(argc, argv, "--tile-y0", &f);
+    int tile_w = arg_i(argc, argv, "--tile-w", &f);
+    int tile_h = arg_i(argc, argv, "--tile-h", &f);
+    if (!f) tile_w = width - tile_x0;
+    if (!f) tile_h = height - tile_y0;
+    if (tile_x0 < 0 || tile_y0 < 0 || tile_w <= 0 || tile_h <= 0 ||
+        tile_x0 + tile_w > width || tile_y0 + tile_h > height) {
+        fprintf(stderr, "invalid tile bounds\n");
+        return 2;
+    }
     double min_x = arg_f(argc, argv, "--min-x", &f);
     ok &= require(f, "--min-x");
     double max_y = arg_f(argc, argv, "--max-y", &f);
@@ -177,9 +201,9 @@ int main(int argc, char **argv) {
     int covered = 0;
     int err_counts[6] = {0, 0, 0, 0, 0, 0};
 
-    for (int row = 0; row < height; row++) {
+    for (int row = tile_y0; row < tile_y0 + tile_h; row++) {
         double y = max_y - (double)row * resolution;
-        for (int col = 0; col < width; col++) {
+        for (int col = tile_x0; col < tile_x0 + tile_w; col++) {
             double x = min_x + (double)col * resolution;
             size_t idx = (size_t)row * (size_t)width + (size_t)col;
             double dbm = run_itm_path(surface, width, height, min_x, max_y,
@@ -197,19 +221,41 @@ int main(int argc, char **argv) {
     }
 
     std::string base(out_prefix);
-    fp = fopen((base + ".signal_i16le.bin").c_str(), "wb");
+    bool full_tile = (tile_x0 == 0 && tile_y0 == 0 &&
+                      tile_w == width && tile_h == height);
+    char suffix[64];
+    if (full_tile) {
+        snprintf(suffix, sizeof(suffix), ".signal_i16le.bin");
+    } else {
+        snprintf(suffix, sizeof(suffix), "_x%d_y%d.signal_i16le.bin", tile_x0, tile_y0);
+    }
+    char mask_suffix[64];
+    if (full_tile) {
+        snprintf(mask_suffix, sizeof(mask_suffix), ".mask_u8.bin");
+    } else {
+        snprintf(mask_suffix, sizeof(mask_suffix), "_x%d_y%d.mask_u8.bin", tile_x0, tile_y0);
+    }
+    char meta_suffix[64];
+    if (full_tile) {
+        snprintf(meta_suffix, sizeof(meta_suffix), ".meta.json");
+    } else {
+        snprintf(meta_suffix, sizeof(meta_suffix), "_x%d_y%d.meta.json", tile_x0, tile_y0);
+    }
+    fp = fopen((base + suffix).c_str(), "wb");
     if (!fp)
         return 1;
-    fwrite(signal.data(), sizeof(int16_t), signal.size(), fp);
+    fwrite(signal.data() + (size_t)tile_y0 * (size_t)width + (size_t)tile_x0,
+           sizeof(int16_t), (size_t)tile_w * (size_t)tile_h, fp);
     fclose(fp);
 
-    fp = fopen((base + ".mask_u8.bin").c_str(), "wb");
+    fp = fopen((base + mask_suffix).c_str(), "wb");
     if (!fp)
         return 1;
-    fwrite(mask.data(), sizeof(uint8_t), mask.size(), fp);
+    fwrite(mask.data() + (size_t)tile_y0 * (size_t)width + (size_t)tile_x0,
+           sizeof(uint8_t), (size_t)tile_w * (size_t)tile_h, fp);
     fclose(fp);
 
-    fp = fopen((base + ".meta.json").c_str(), "wb");
+    fp = fopen((base + meta_suffix).c_str(), "wb");
     if (!fp)
         return 1;
     fprintf(fp,
@@ -217,6 +263,10 @@ int main(int argc, char **argv) {
             "  \"model\": \"itm_projected_grid\",\n"
             "  \"width\": %d,\n"
             "  \"height\": %d,\n"
+            "  \"tile_x0\": %d,\n"
+            "  \"tile_y0\": %d,\n"
+            "  \"tile_w\": %d,\n"
+            "  \"tile_h\": %d,\n"
             "  \"resolution_m\": %.6f,\n"
             "  \"min_x\": %.6f,\n"
             "  \"max_y\": %.6f,\n"
@@ -227,11 +277,14 @@ int main(int argc, char **argv) {
             "  \"total_cells\": %d,\n"
             "  \"itm_errnums\": [%d, %d, %d, %d, %d, %d]\n"
             "}\n",
-            width, height, resolution, min_x, max_y, rx_sensitivity, covered,
-            width * height, err_counts[0], err_counts[1], err_counts[2],
+            width, height, tile_x0, tile_y0, tile_w, tile_h,
+            resolution, min_x, max_y,
+            rx_sensitivity, covered,
+            tile_w * tile_h, err_counts[0], err_counts[1], err_counts[2],
             err_counts[3], err_counts[4], err_counts[5]);
     fclose(fp);
 
-    fprintf(stderr, "wrote %s.{signal_i16le.bin,mask_u8.bin,meta.json}\n", out_prefix);
+    fprintf(stderr, "wrote tile x0=%d y0=%d w=%d h=%d into %s.*\n",
+            tile_x0, tile_y0, tile_w, tile_h, out_prefix);
     return 0;
 }

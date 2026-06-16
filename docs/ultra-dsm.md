@@ -3,6 +3,22 @@
 This branch keeps the browser/WASM planner for normal simulations and adds a
 separate backend path for ultra-resolution Spain simulations.
 
+## CI / GHCR
+
+The Docker image workflow at `.github/workflows/docker-image.yml` builds and
+publishes two images on every push to `hires_spain`:
+
+- `ghcr.io/mbenitog/meshtastic-site-spain:latest` — static frontend.
+- `ghcr.io/mbenitog/meshtastic-site-spain-ultra:latest` — FastAPI backend
+  with the native `ultra_cli` and the `splat` submodule compiled in.
+
+Pull and run the backend standalone with:
+
+```bash
+docker pull ghcr.io/mbenitog/meshtastic-site-spain-ultra:latest
+docker run --rm -p 8000:8000 ghcr.io/mbenitog/meshtastic-site-spain-ultra:latest
+```
+
 ## Data Source
 
 IGN's DSM WCS endpoint is CORS-enabled and currently responds at:

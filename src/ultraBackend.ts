@@ -42,7 +42,7 @@ interface UltraCoverageProbe {
 }
 
 const SURFACE_MODE_LABELS: Record<UltraSurfaceMode, string> = {
-  lod_dtm_plus_buildings: 'LOD (2.5 m detail + DTM fallback)',
+  lod_dtm_plus_buildings: 'LOD (2.5 m detail + 5 m surface fallback)',
   dtm_plus_buildings_2_5m: 'Strict 2.5 m (fail if unavailable)',
   dtm_plus_surface_2_5m: '2.5 m + vegetation (fail if unavailable)',
   dtm_only: 'DTM 5 m only (no buildings)',

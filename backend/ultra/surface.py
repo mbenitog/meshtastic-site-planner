@@ -29,7 +29,7 @@ class SurfaceGrid:
     """Per-cell source/origin. Same shape as ``values``. 0 = dtm fallback
     (DTM 5 m only, no 2.5 m DSM/vegetation sample available).
     1 = dtm + mdsn_e025 (2.5 m building DSM), 2 = dtm + mdsn_v025
-    (vegetation), 3 = dtm + mds05 (5 m absolute surface)."""
+    (vegetation), 3 = mds05 absolute 5 m surface."""
 
     @property
     def max_x(self) -> float:
@@ -99,10 +99,15 @@ class SurfaceBuilder:
                 "choose dtm_only mode if your client supports it."
             )
 
+        # Fetch the absolute 5 m surface as the measured coarse fallback.
+        # In LOD mode this preserves real buildings/trees where 2.5 m products
+        # are unavailable instead of dropping immediately to bare-ground DTM.
+        surface_5m = self._try_fetch_arcgrid("mds05", min_x, min_y, max_x, max_y, tiled=True)
+
         # Fetch the 2.5 m building DSM and (optionally) the 2.5 m vegetation
         # layer. Each fetch is best-effort: if the bbox is outside IGN coverage
-        # the corresponding layer is left as ``None`` and cells fall back to DTM
-        # only. Large bboxes are split into WCS sub-requests by the client
+        # the corresponding layer is left as ``None`` and cells fall back to the
+        # coarser measured surface. Large bboxes are split into WCS sub-requests by the client
         # because the IGN endpoint rejects oversized responses.
         buildings = self._try_fetch_arcgrid("mdsn_e025", min_x, min_y, max_x, max_y, tiled=True)
         want_vegetation = mode == "dtm_plus_surface_2_5m"
@@ -128,16 +133,19 @@ class SurfaceBuilder:
             for x in range(width):
                 px = min_x + x * resolution_m
                 terrain_m = terrain.sample_nearest(px, py)
-                building_m = (
-                    max(0.0, _sample_arcgrid_nearest(buildings, px, py) or 0.0)
-                    if buildings is not None
-                    else 0.0
-                )
-                vegetation_m = (
-                    max(0.0, _sample_arcgrid_nearest(vegetation, px, py) or 0.0)
-                    if vegetation is not None
-                    else 0.0
-                )
+                building_raw = _sample_arcgrid_nearest(buildings, px, py) if buildings is not None else None
+                vegetation_raw = _sample_arcgrid_nearest(vegetation, px, py) if vegetation is not None else None
+                surface_5m_raw = _sample_arcgrid_nearest(surface_5m, px, py) if surface_5m is not None else None
+
+                building_m = max(0.0, building_raw or 0.0)
+                vegetation_m = max(0.0, vegetation_raw or 0.0)
+                surface_5m_m = max(terrain_m, surface_5m_raw) if surface_5m_raw is not None else None
+
+                if mode == "dtm_only":
+                    values.append(terrain_m)
+                    sources.append(0)
+                    continue
+
                 if building_m > 0.0:
                     obstruction = max(building_m, vegetation_m)
                     if vegetation_m >= building_m > 0.0:
@@ -147,6 +155,12 @@ class SurfaceBuilder:
                 elif vegetation_m > 0.0:
                     obstruction = vegetation_m
                     source = 2
+                elif surface_5m_m is not None and mode == "lod_dtm_plus_buildings":
+                    # Coarser but still measured absolute surface. This keeps
+                    # real buildings/trees instead of collapsing to bare ground.
+                    values.append(surface_5m_m)
+                    sources.append(3)
+                    continue
                 else:
                     obstruction = 0.0
                     source = 0

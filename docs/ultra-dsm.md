@@ -42,6 +42,8 @@ Working interpretation for ultra mode:
 - Use the best available measured absolute ground reference from IGN DTM.
 - Add measured 2.5 m normalized DSM heights from `mdsn_e025` to represent real
   buildings/surface features at the highest available resolution.
+- Where `mdsn_e025` is unavailable, fall back per cell to measured `mds05`
+  absolute 5 m surface instead of bare ground.
 - Optionally add measured 2.5 m `mdsn_v025` vegetation heights if we decide
   vegetation should obstruct RF at this scale.
 - Compose the RF obstruction surface from measured IGN products only. Do not

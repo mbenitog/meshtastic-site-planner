@@ -16,6 +16,7 @@ from .ign_dsm import IgnDsmClient
 from .surface import SurfaceBuilder, SurfaceMode
 from .artifacts import write_surface_artifact
 from .runner import run_native_ultra, write_native_runner_input
+from .render import write_coverage_png
 
 
 app = FastAPI(title="Meshtastic Site Planner Ultra DSM Backend")
@@ -38,6 +39,7 @@ ArtifactName = Literal[
     "coverage_signal",
     "coverage_mask",
     "coverage_meta",
+    "coverage_png",
 ]
 ARTIFACT_FILES: dict[str, tuple[str, str]] = {
     "job": ("job.json", "application/json"),
@@ -47,6 +49,7 @@ ARTIFACT_FILES: dict[str, tuple[str, str]] = {
     "coverage_signal": ("coverage.signal_i16le.bin", "application/octet-stream"),
     "coverage_mask": ("coverage.mask_u8.bin", "application/octet-stream"),
     "coverage_meta": ("coverage.meta.json", "application/json"),
+    "coverage_png": ("coverage.png", "image/png"),
 }
 
 
@@ -107,6 +110,15 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
         native_result = run_native_ultra(artifact, job["request"], job_dir(job_id))
         job["native_result"] = asdict(native_result)
         if native_result.status == "complete":
+            png_path = write_coverage_png(
+                signal_path=native_result.signal_path or "",
+                mask_path=native_result.mask_path or "",
+                out_path=job_dir(job_id) / "coverage.png",
+                width=artifact.width,
+                height=artifact.height,
+                min_dbm=request.rx_sensitivity_dbm,
+            )
+            job["coverage_png"] = {"path": png_path}
             job["status"] = "coverage_ready"
             job["message"] = (
                 "Native ultra coverage is ready. Model is ITM/Longley-Rice over the measured projected 2.5 m surface grid."

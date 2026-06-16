@@ -90,9 +90,28 @@ def set_progress(job: dict, phase: str, fraction: float) -> None:
     job["progress"] = {"phase": phase, "fraction": max(0.0, min(1.0, fraction))}
 
 
+def is_cancel_requested(job_id: str) -> bool:
+    job = jobs.get(job_id) or load_job(job_id)
+    return bool(job and job.get("cancel_requested"))
+
+
+def mark_cancelled(job_id: str, *, message: str = "Ultra job cancelled.") -> None:
+    job = jobs.get(job_id) or load_job(job_id)
+    if not job:
+        return
+    job["status"] = "cancelled"
+    job["message"] = message
+    set_progress(job, "finalize", 1.0)
+    jobs[job_id] = job
+    persist_job(job_id, job)
+
+
 def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
     job = jobs.get(job_id) or load_job(job_id)
     if not job:
+        return
+    if job.get("cancel_requested"):
+        mark_cancelled(job_id, message="Ultra job cancelled before execution started.")
         return
     job["status"] = "building_surface"
     job["message"] = "Building measured 2.5 m surface grid."
@@ -108,6 +127,9 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
             mode=request.surface_mode,
         )
         artifact = write_surface_artifact(grid, job_dir(job_id))
+        if is_cancel_requested(job_id):
+            mark_cancelled(job_id, message="Ultra job cancelled after surface build.")
+            return
         runner_input = write_native_runner_input(artifact, job["request"], job_dir(job_id))
         job["surface"] = asdict(artifact)
         job["runner_input"] = asdict(runner_input)
@@ -127,6 +149,9 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
             request=job["request"],
             tiles=tiles,
         )
+        if native_result.status == "cancelled":
+            mark_cancelled(job_id)
+            return
         job["native_result"] = asdict(native_result)
         if native_result.status == "complete":
             png_path = write_coverage_png(
@@ -195,6 +220,13 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
     tx_x, tx_y = latlon_to_utm30(request["lat"], request["lon"])
     total = len(tiles)
     for tile in tiles:
+        if is_cancel_requested(job_id):
+            from .runner import NativeRunResult
+            return NativeRunResult(
+                status="cancelled",
+                model="itm_projected_grid",
+                message="Ultra job cancelled during tiled native execution.",
+            )
         sig_path = out_dir / f"coverage_x{tile.x0}_y{tile.y0}.signal_i16le.bin"
         if sig_path.exists():
             _advance_tile_progress(job_id, total)
@@ -405,6 +437,7 @@ def create_ultra_job(request: UltraJobRequest, background_tasks: BackgroundTasks
         "request": request.model_dump(),
         "estimate": estimate,
         "message": "Queued for tiled projected-grid ITM execution.",
+        "cancel_requested": False,
     }
     set_progress(job, "terrain", 0.02)
     jobs[job_id] = job
@@ -427,6 +460,22 @@ def get_ultra_job(job_id: str) -> dict:
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     jobs[job_id] = job
+    return public_job(job_id, job)
+
+
+@app.post("/ultra/jobs/{job_id}/cancel")
+def cancel_ultra_job(job_id: str) -> dict:
+    job = jobs.get(job_id) or load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    if job.get("status") in {"coverage_ready", "failed", "cancelled"}:
+        jobs[job_id] = job
+        return public_job(job_id, job)
+    job["cancel_requested"] = True
+    if job.get("status") == "queued":
+        job["message"] = "Ultra job cancellation requested."
+    jobs[job_id] = job
+    persist_job(job_id, job)
     return public_job(job_id, job)
 
 

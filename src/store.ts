@@ -19,7 +19,7 @@ import { loadParams, mergeParams, saveParams } from './persist.ts';
 import { decodeSharedHash, buildShareUrl, clearSharedHash } from './permalink.ts';
 import { coverageStats } from './coverageStats.ts';
 import { TerrainService } from './terrain/TerrainService.ts';
-import { runUltraBackend, probeUltraCoverage, type UltraSurfaceMode } from './ultraBackend.ts';
+import { cancelUltraJob, runUltraBackend, probeUltraCoverage, type UltraSurfaceMode } from './ultraBackend.ts';
 import type { UltraBackendResult } from './ultraBackend.ts';
 
 // Module-level singletons: workers, terrain cache, and map handles outlive
@@ -258,6 +258,7 @@ const useStore = defineStore('store', {
       /** Measure/ruler tool (#15). */
       measureMode: false,
       measureResult: null as { distanceKm: number; bearingDeg: number } | null,
+      currentUltraJobId: '' as string,
     }
   },
   actions: {
@@ -868,7 +869,17 @@ const useStore = defineStore('store', {
       const marker = siteMarkers.get(site.id);
       if (marker && !marker.getPopup()?.isOpen()) marker.togglePopup();
     },
-    cancelSimulation() {
+    async cancelSimulation() {
+      if (this.splatParams.simulation.ultra_backend && this.currentUltraJobId) {
+        try {
+          await cancelUltraJob(
+            this.splatParams.simulation.ultra_backend_url || 'http://127.0.0.1:8000',
+            this.currentUltraJobId,
+          );
+        } catch (error) {
+          console.warn('Ultra cancel request failed:', error);
+        }
+      }
       abortController?.abort();
     },
     async runSimulation() {
@@ -909,7 +920,12 @@ const useStore = defineStore('store', {
               }
               return runUltraBackend(this.splatParams, abortController.signal, (p) => {
                 this.progress = p;
-              }, { surfaceMode });
+              }, {
+                surfaceMode,
+                onJobCreated: (jobId) => {
+                  this.currentUltraJobId = jobId;
+                },
+              });
             })()
           : await (await getEngine()).run(params, {
               terrain: getTerrain(),
@@ -972,6 +988,7 @@ const useStore = defineStore('store', {
           this.simulationState = 'failed';
         }
       } finally {
+        this.currentUltraJobId = '';
         this.progress = null;
         abortController = undefined;
       }

@@ -67,6 +67,13 @@ export async function probeUltraCoverage(
   });
 }
 
+export async function cancelUltraJob(baseUrl: string, jobId: string): Promise<void> {
+  const response = await fetch(joinUrl(baseUrl, `/ultra/jobs/${jobId}/cancel`), {
+    method: 'POST',
+  });
+  if (!response.ok) throw new Error(`cancel failed: ${response.status}`);
+}
+
 interface UltraSurfaceMeta {
   bounds_wgs84?: CoverageResult['bounds'];
   mode?: string;
@@ -156,7 +163,7 @@ export async function runUltraBackend(
   params: SplatParams,
   signal?: AbortSignal,
   onProgress?: (p: CoverageProgress) => void,
-  options: { surfaceMode?: UltraSurfaceMode } = {},
+  options: { surfaceMode?: UltraSurfaceMode; onJobCreated?: (jobId: string) => void } = {},
 ): Promise<UltraBackendResult> {
   const baseUrl = params.simulation.ultra_backend_url || 'http://127.0.0.1:8000';
   const surfaceMode: UltraSurfaceMode = options.surfaceMode ?? 'lod_dtm_plus_buildings';
@@ -186,6 +193,7 @@ export async function runUltraBackend(
       surface_mode: surfaceMode,
     }),
   });
+  options.onJobCreated?.(job.job_id);
   emitProgress(job.progress, onProgress);
 
   const state = await waitForUltraJob(baseUrl, job.job_id, signal, onProgress);

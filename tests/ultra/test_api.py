@@ -2,7 +2,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from backend.ultra.main import app
+from backend.ultra.main import app, jobs, persist_job
 
 
 client = TestClient(app)
@@ -51,6 +51,24 @@ def test_create_ultra_job_returns_artifact_urls():
     assert body["status"] == "queued"
     assert "job_id" in body
     assert body["progress"]["phase"] == "terrain"
+
+
+def test_cancel_ultra_job_marks_request():
+    job_id = "cancel-me"
+    job = {
+        "status": "queued",
+        "request": {},
+        "estimate": {},
+        "message": "Queued for tiled projected-grid ITM execution.",
+        "cancel_requested": False,
+        "progress": {"phase": "terrain", "fraction": 0.02},
+    }
+    jobs[job_id] = job
+    persist_job(job_id, job)
+    cancel = client.post(f"/ultra/jobs/{job_id}/cancel")
+    assert cancel.status_code == 200
+    body = cancel.json()
+    assert body.get("cancel_requested") is True
 
 
 def test_ultra_job_request_rejects_bad_radius():

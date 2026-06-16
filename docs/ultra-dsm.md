@@ -138,9 +138,15 @@ temporary buffers or chunk overlap. Examples:
 - 30 km radius: ~576 million cells, requires careful chunking and disk-backed
   outputs.
 
-The current direct ITM runner materializes and computes jobs synchronously only
-up to 100,000 cells. Larger jobs are accepted but remain queued until the
-background tiled runner is implemented.
+The backend runs every supported job in the background through the FastAPI
+`BackgroundTasks` worker. Jobs are split into ~250 000-cell tiles which the
+native ITM runner executes sequentially, persisting per-tile signal/mask
+files and aggregating them into the final coverage output. Resume after a
+restart is supported because tiles that already produced a file are skipped.
+
+A 1 km radius around Madrid (641 601 cells, 4 tiles) typically finishes in
+under a minute on a single core. Radii beyond the local IGN coverage area
+fail fast at the surface-build step instead of producing an empty grid.
 
 Each prototype job writes these files under `.cache/ultra-jobs/<job_id>/`:
 

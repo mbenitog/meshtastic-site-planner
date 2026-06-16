@@ -221,27 +221,13 @@ int main(int argc, char **argv) {
     }
 
     std::string base(out_prefix);
-    bool full_tile = (tile_x0 == 0 && tile_y0 == 0 &&
-                      tile_w == width && tile_h == height);
-    char suffix[64];
-    if (full_tile) {
-        snprintf(suffix, sizeof(suffix), ".signal_i16le.bin");
-    } else {
-        snprintf(suffix, sizeof(suffix), "_x%d_y%d.signal_i16le.bin", tile_x0, tile_y0);
-    }
+    char signal_suffix[64];
+    snprintf(signal_suffix, sizeof(signal_suffix), "_x%d_y%d.signal_i16le.bin", tile_x0, tile_y0);
     char mask_suffix[64];
-    if (full_tile) {
-        snprintf(mask_suffix, sizeof(mask_suffix), ".mask_u8.bin");
-    } else {
-        snprintf(mask_suffix, sizeof(mask_suffix), "_x%d_y%d.mask_u8.bin", tile_x0, tile_y0);
-    }
+    snprintf(mask_suffix, sizeof(mask_suffix), "_x%d_y%d.mask_u8.bin", tile_x0, tile_y0);
     char meta_suffix[64];
-    if (full_tile) {
-        snprintf(meta_suffix, sizeof(meta_suffix), ".meta.json");
-    } else {
-        snprintf(meta_suffix, sizeof(meta_suffix), "_x%d_y%d.meta.json", tile_x0, tile_y0);
-    }
-    fp = fopen((base + suffix).c_str(), "wb");
+    snprintf(meta_suffix, sizeof(meta_suffix), "_x%d_y%d.meta.json", tile_x0, tile_y0);
+    fp = fopen((base + signal_suffix).c_str(), "wb");
     if (!fp)
         return 1;
     fwrite(signal.data() + (size_t)tile_y0 * (size_t)width + (size_t)tile_x0,

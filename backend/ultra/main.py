@@ -15,8 +15,9 @@ from .geo import meter_bbox_around
 from .ign_dsm import IgnDsmClient
 from .surface import SurfaceBuilder, SurfaceMode
 from .artifacts import write_surface_artifact
-from .runner import run_native_ultra, write_native_runner_input
+from .runner import run_tiled_native_ultra, write_native_runner_input
 from .render import write_coverage_png, write_png_world_file
+from .tiler import plan_tiles
 
 
 app = FastAPI(title="Meshtastic Site Planner Ultra DSM Backend")
@@ -30,7 +31,7 @@ ign = IgnDsmClient()
 surface_builder = SurfaceBuilder(dsm_client=ign)
 jobs: dict[str, dict] = {}
 JOB_ROOT = Path(".cache/ultra-jobs")
-MAX_SYNC_SURFACE_CELLS = 100_000
+TILE_MAX_CELLS = 250_000
 ArtifactName = Literal[
     "job",
     "surface",
@@ -111,11 +112,21 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
         job["surface"] = asdict(artifact)
         job["runner_input"] = asdict(runner_input)
         job["status"] = "running_native"
-        job["message"] = "Running ITM/Longley-Rice over measured projected-grid terrain."
-        set_progress(job, "compute", 0.5)
+        job["message"] = "Running ITM/Longley-Rice over measured projected-grid terrain in tiles."
+        set_progress(job, "compute", 0.4)
+        tiles = plan_tiles(artifact.width, artifact.height, TILE_MAX_CELLS)
+        job["tiles"] = {
+            "count": len(tiles),
+            "completed": 0,
+        }
         persist_job(job_id, job)
 
-        native_result = run_native_ultra(artifact, job["request"], job_dir(job_id))
+        native_result = _run_tiles_with_progress(
+            job_id=job_id,
+            artifact=artifact,
+            request=job["request"],
+            tiles=tiles,
+        )
         job["native_result"] = asdict(native_result)
         if native_result.status == "complete":
             png_path = write_coverage_png(
@@ -151,6 +162,74 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
         set_progress(job, "finalize", 1.0)
         job["error"] = f"surface build failed: {exc}"
     jobs[job_id] = job
+    persist_job(job_id, job)
+
+
+def _run_tiles_with_progress(job_id, artifact, request, tiles):
+    """Run the tiled native runner, persisting tile-level progress into the
+    in-memory job after each completed tile so the polling client sees a
+    live fraction."""
+    from .runner import run_tiled_native_ultra
+    from .tiler import TileSpec
+    # Inline the per-tile loop here so we can write per-tile progress; the
+    # helper still owns the final aggregation step.
+    import os
+    import subprocess
+    from pathlib import Path
+
+    binary = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli")).resolve()
+    if not binary.exists():
+        from .runner import NativeRunResult
+        return NativeRunResult(
+            status="missing_binary",
+            model="itm_projected_grid",
+            message=f"native ultra runner not found at {binary}; run engine/build_native.sh",
+        )
+
+    out_dir = job_dir(job_id).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_prefix = out_dir / "coverage"
+    from .geo import latlon_to_utm30
+    from .runner import _build_cmd
+
+    tx_x, tx_y = latlon_to_utm30(request["lat"], request["lon"])
+    total = len(tiles)
+    for tile in tiles:
+        sig_path = out_dir / f"coverage_x{tile.x0}_y{tile.y0}.signal_i16le.bin"
+        if sig_path.exists():
+            _advance_tile_progress(job_id, total)
+            continue
+        cmd = _build_cmd(binary, artifact, tile, request, tx_x, tx_y, out_prefix)
+        try:
+            subprocess.run(
+                cmd, check=True, capture_output=True, text=True, timeout=600
+            )
+        except Exception as exc:
+            from .runner import NativeRunResult
+            return NativeRunResult(
+                status="failed",
+                model="itm_projected_grid",
+                message=f"tile ({tile.x0},{tile.y0}) failed: {exc}",
+            )
+        _advance_tile_progress(job_id, total)
+
+    # Aggregation step is the same as the helper.
+    return run_tiled_native_ultra(
+        artifact=artifact,
+        request=request,
+        out_dir=out_dir,
+        max_tile_cells=TILE_MAX_CELLS,
+    )
+
+
+def _advance_tile_progress(job_id: str, total: int) -> None:
+    job = jobs.get(job_id)
+    if not job:
+        return
+    done = int(job.get("tiles", {}).get("completed", 0)) + 1
+    job.setdefault("tiles", {})["completed"] = done
+    fraction = 0.4 + 0.5 * (done / max(1, total))
+    set_progress(job, "compute", fraction)
     persist_job(job_id, job)
 
 
@@ -277,25 +356,12 @@ def create_ultra_job(request: UltraJobRequest, background_tasks: BackgroundTasks
         "status": "queued",
         "request": request.model_dump(),
         "estimate": estimate,
-        "message": "Native 2.5 m DSM RF runner is not wired yet.",
+        "message": "Queued for tiled projected-grid ITM execution.",
     }
-    set_progress(job, "terrain", 0.0)
+    set_progress(job, "terrain", 0.02)
     jobs[job_id] = job
     persist_job(job_id, job)
-
-    if estimate["cells"] <= MAX_SYNC_SURFACE_CELLS:
-        job["message"] = "Queued for direct projected-grid ITM execution."
-        set_progress(job, "terrain", 0.02)
-        persist_job(job_id, job)
-        background_tasks.add_task(run_ultra_job, job_id, request)
-    else:
-        job["status"] = "queued"
-        set_progress(job, "terrain", 0.0)
-        job["message"] = (
-            "Surface grid is too large for synchronous direct ITM materialization; "
-            "background tiled execution is required."
-        )
-        persist_job(job_id, job)
+    background_tasks.add_task(run_ultra_job, job_id, request)
 
     return {
         "job_id": job_id,

@@ -6,7 +6,7 @@ import json
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -78,6 +78,50 @@ def artifact_urls(job_id: str) -> dict[str, str]:
 
 def public_job(job_id: str, job: dict) -> dict:
     return job | {"artifact_urls": artifact_urls(job_id)}
+
+
+def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
+    job = jobs.get(job_id) or load_job(job_id)
+    if not job:
+        return
+    job["status"] = "building_surface"
+    job["message"] = "Building measured 2.5 m surface grid."
+    jobs[job_id] = job
+    persist_job(job_id, job)
+    try:
+        grid = surface_builder.build(
+            lat=request.lat,
+            lon=request.lon,
+            radius_m=request.radius_km * 1000,
+            resolution_m=request.resolution_m,
+            mode=request.surface_mode,
+        )
+        artifact = write_surface_artifact(grid, job_dir(job_id))
+        runner_input = write_native_runner_input(artifact, job["request"], job_dir(job_id))
+        job["surface"] = asdict(artifact)
+        job["runner_input"] = asdict(runner_input)
+        job["status"] = "running_native"
+        job["message"] = "Running ITM/Longley-Rice over measured projected-grid terrain."
+        persist_job(job_id, job)
+
+        native_result = run_native_ultra(artifact, job["request"], job_dir(job_id))
+        job["native_result"] = asdict(native_result)
+        if native_result.status == "complete":
+            job["status"] = "coverage_ready"
+            job["message"] = (
+                "Native ultra coverage is ready. Model is ITM/Longley-Rice over the measured projected 2.5 m surface grid."
+            )
+        elif native_result.status == "missing_binary":
+            job["status"] = "surface_ready"
+            job["message"] = native_result.message
+        else:
+            job["status"] = "failed"
+            job["error"] = f"native ultra runner failed: {native_result.message}"
+    except Exception as exc:
+        job["status"] = "failed"
+        job["error"] = f"surface build failed: {exc}"
+    jobs[job_id] = job
+    persist_job(job_id, job)
 
 
 def estimate_grid(radius_km: float, resolution_m: float) -> dict[str, float | int]:
@@ -196,7 +240,7 @@ def surface_sample(request: SurfaceSampleRequest) -> dict:
 
 
 @app.post("/ultra/jobs")
-def create_ultra_job(request: UltraJobRequest) -> dict:
+def create_ultra_job(request: UltraJobRequest, background_tasks: BackgroundTasks) -> dict:
     job_id = str(uuid4())
     estimate = estimate_grid(request.radius_km, request.resolution_m)
     job = {
@@ -209,37 +253,9 @@ def create_ultra_job(request: UltraJobRequest) -> dict:
     persist_job(job_id, job)
 
     if estimate["cells"] <= MAX_SYNC_SURFACE_CELLS:
-        job["status"] = "building_surface"
+        job["message"] = "Queued for direct projected-grid ITM execution."
         persist_job(job_id, job)
-        try:
-            grid = surface_builder.build(
-                lat=request.lat,
-                lon=request.lon,
-                radius_m=request.radius_km * 1000,
-                resolution_m=request.resolution_m,
-                mode=request.surface_mode,
-            )
-            artifact = write_surface_artifact(grid, job_dir(job_id))
-            runner_input = write_native_runner_input(artifact, job["request"], job_dir(job_id))
-            job["surface"] = asdict(artifact)
-            job["runner_input"] = asdict(runner_input)
-            native_result = run_native_ultra(artifact, job["request"], job_dir(job_id))
-            job["native_result"] = asdict(native_result)
-            if native_result.status == "complete":
-                job["status"] = "coverage_ready"
-                job["message"] = (
-                    "Native ultra coverage is ready. Model is ITM/Longley-Rice over the measured projected 2.5 m surface grid."
-                )
-            elif native_result.status == "missing_binary":
-                job["status"] = "surface_ready"
-                job["message"] = native_result.message
-            else:
-                job["status"] = "failed"
-                job["error"] = f"native ultra runner failed: {native_result.message}"
-        except Exception as exc:
-            job["status"] = "failed"
-            job["error"] = f"surface build failed: {exc}"
-        persist_job(job_id, job)
+        background_tasks.add_task(run_ultra_job, job_id, request)
     else:
         job["status"] = "queued"
         job["message"] = (
@@ -248,7 +264,13 @@ def create_ultra_job(request: UltraJobRequest) -> dict:
         )
         persist_job(job_id, job)
 
-    return {"job_id": job_id, "status": job["status"], "estimate": estimate, "artifact_urls": artifact_urls(job_id)}
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "message": job["message"],
+        "estimate": estimate,
+        "artifact_urls": artifact_urls(job_id),
+    }
 
 
 @app.get("/ultra/jobs/{job_id}")

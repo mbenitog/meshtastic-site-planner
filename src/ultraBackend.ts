@@ -63,6 +63,32 @@ async function readArrayBuffer(url: string, signal?: AbortSignal): Promise<Array
   return response.arrayBuffer();
 }
 
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const id = window.setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        window.clearTimeout(id);
+        reject(new DOMException('Aborted', 'AbortError'));
+      },
+      { once: true }
+    );
+  });
+}
+
+async function waitForUltraJob(baseUrl: string, jobId: string, signal?: AbortSignal): Promise<UltraJobState> {
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const state = await readJson<UltraJobState>(joinUrl(baseUrl, `/ultra/jobs/${jobId}`), { signal });
+    if (state.status === 'coverage_ready' || state.status === 'failed' || state.status === 'surface_ready') {
+      return state;
+    }
+    await sleep(1500, signal);
+  }
+  throw new Error('Ultra backend job timed out');
+}
+
 export async function runUltraBackend(
   params: SplatParams,
   signal?: AbortSignal
@@ -95,7 +121,7 @@ export async function runUltraBackend(
     }),
   });
 
-  const state = await readJson<UltraJobState>(joinUrl(baseUrl, `/ultra/jobs/${job.job_id}`), { signal });
+  const state = await waitForUltraJob(baseUrl, job.job_id, signal);
   if (state.status !== 'coverage_ready') {
     throw new Error(`Ultra backend job ${state.status}. Direct synchronous ITM jobs are limited to about 250 m radius.`);
   }

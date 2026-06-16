@@ -80,7 +80,8 @@ curl -X POST http://127.0.0.1:8000/surface/sample \
   -d '{"lat":40.41696,"lon":-3.703508,"radius_m":25,"resolution_m":2.5,"mode":"dtm_plus_buildings_2_5m"}'
 ```
 
-Create an ultra ITM job and download output artifacts:
+Create an ultra ITM job and download output artifacts. Job creation returns
+immediately; poll the job URL until `status` is `coverage_ready`.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/ultra/jobs \

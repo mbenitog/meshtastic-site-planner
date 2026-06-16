@@ -22,6 +22,10 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -37,11 +41,17 @@ jobs:
           path: test/.cache
           key: srtm-test-tiles-v1
 
+      - name: Install ultra backend test dependencies
+        run: python -m pip install -r backend/requirements-ultra-dev.txt
+
       - name: Type check
         run: pnpm exec vue-tsc -b
 
       - name: Tests (golden, terrain, engine invariants)
         run: pnpm test
+
+      - name: Ultra backend tests
+        run: python -m pytest tests/ultra
 
       - name: Build site
         run: pnpm build

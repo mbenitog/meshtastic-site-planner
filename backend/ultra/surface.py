@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
+import logging
 import multiprocessing as mp
 import os
 import sys
+import time
 from typing import Literal
 
 from .coverage_json import CoverageApiClient, DTM_5M_25830
@@ -21,6 +23,7 @@ SurfaceMode = Literal[
 
 SURFACE_PROCESS_MIN_CELLS = 200_000
 SURFACE_ROW_BLOCK = 64
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -160,6 +163,7 @@ class SurfaceBuilder:
     ) -> None:
         self.dsm = dsm_client or IgnDsmClient()
         self.coverages = coverage_client or CoverageApiClient()
+        self.last_stats: dict[str, float | int | str | None] = {}
 
     def build(
         self,
@@ -170,14 +174,23 @@ class SurfaceBuilder:
         resolution_m: float = 2.5,
         mode: SurfaceMode = "lod_dtm_plus_buildings",
     ) -> SurfaceGrid:
+        started = time.perf_counter()
         min_x, min_y, max_x, max_y = meter_bbox_around(lat, lon, radius_m)
         width = int((max_x - min_x) / resolution_m) + 1
         height = int((max_y - min_y) / resolution_m) + 1
         cells = width * height
+        stats: dict[str, float | int | str | None] = {
+            "cells": cells,
+            "width": width,
+            "height": height,
+            "mode": mode,
+        }
 
         # Always fetch the DTM 5 m ground reference. This is mandatory: every
         # surface cell is at minimum DTM elevation.
+        t0 = time.perf_counter()
         terrain = self._try_fetch_dtm(min_x, min_y, max_x, max_y)
+        stats["fetch_dtm_s"] = round(time.perf_counter() - t0, 3)
         if terrain is None:
             raise RuntimeError(
                 "DTM 5 m coverage is required for ultra surface but is not "
@@ -188,18 +201,24 @@ class SurfaceBuilder:
         # Fetch the absolute 5 m surface as the measured coarse fallback.
         # In LOD mode this preserves real buildings/trees where 2.5 m products
         # are unavailable instead of dropping immediately to bare-ground DTM.
+        t0 = time.perf_counter()
         surface_5m = self._try_fetch_arcgrid("mds05", min_x, min_y, max_x, max_y, tiled=True)
+        stats["fetch_mds05_s"] = round(time.perf_counter() - t0, 3)
 
         # Fetch the 2.5 m building DSM and (optionally) the 2.5 m vegetation
         # layer. Each fetch is best-effort: if the bbox is outside IGN coverage
         # the corresponding layer is left as ``None`` and cells fall back to the
         # coarser measured surface. Large bboxes are split into WCS sub-requests by the client
         # because the IGN endpoint rejects oversized responses.
+        t0 = time.perf_counter()
         buildings = self._try_fetch_arcgrid("mdsn_e025", min_x, min_y, max_x, max_y, tiled=True)
+        stats["fetch_mdsn_e025_s"] = round(time.perf_counter() - t0, 3)
         want_vegetation = mode == "dtm_plus_surface_2_5m"
         vegetation = None
         if want_vegetation:
+            t0 = time.perf_counter()
             vegetation = self._try_fetch_arcgrid("mdsn_v025", min_x, min_y, max_x, max_y, tiled=True)
+            stats["fetch_mdsn_v025_s"] = round(time.perf_counter() - t0, 3)
 
         # In strict 2.5 m modes we require the 2.5 m building layer. If it is
         # not available the surface build fails because the user explicitly
@@ -213,6 +232,8 @@ class SurfaceBuilder:
             )
 
         workers = _surface_process_count(height, cells)
+        stats["surface_workers"] = workers
+        t0 = time.perf_counter()
         row_ranges = [
             (row_start, min(height, row_start + SURFACE_ROW_BLOCK))
             for row_start in range(0, height, SURFACE_ROW_BLOCK)
@@ -259,6 +280,21 @@ class SurfaceBuilder:
             for _, part_values, part_sources in parts:
                 values.extend(part_values)
                 sources.extend(part_sources)
+        stats["compose_surface_s"] = round(time.perf_counter() - t0, 3)
+        stats["total_surface_build_s"] = round(time.perf_counter() - started, 3)
+        self.last_stats = stats
+        logger.info(
+            "surface.build cells=%s mode=%s workers=%s dtm=%.3fs mds05=%.3fs mdsn_e025=%.3fs mdsn_v025=%s compose=%.3fs total=%.3fs",
+            cells,
+            mode,
+            workers,
+            stats.get("fetch_dtm_s", 0.0),
+            stats.get("fetch_mds05_s", 0.0),
+            stats.get("fetch_mdsn_e025_s", 0.0),
+            stats.get("fetch_mdsn_v025_s"),
+            stats.get("compose_surface_s", 0.0),
+            stats.get("total_surface_build_s", 0.0),
+        )
 
         return SurfaceGrid(
             width=width,

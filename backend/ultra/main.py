@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import asdict
 from pathlib import Path
 import json
+import time
 from typing import Literal
 from uuid import uuid4
 
@@ -20,6 +22,8 @@ from .runner import run_tiled_native_ultra, write_native_runner_input
 from .render import write_coverage_png, write_png_world_file
 from .tiler import plan_tiles
 
+
+logger = logging.getLogger(__name__)
 
 ULTRA_API_PREFIX = os.environ.get("ULTRA_API_PREFIX", "/ultra-api").rstrip("/") or ""
 ULTRA_PUBLIC_BASE_URL = os.environ.get("ULTRA_PUBLIC_BASE_URL", "").rstrip("/")
@@ -140,6 +144,8 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
     jobs[job_id] = job
     persist_job(job_id, job)
     try:
+        timings: dict[str, float | int | str | None] = {}
+        t0 = time.perf_counter()
         grid = surface_builder.build(
             lat=request.lat,
             lon=request.lon,
@@ -147,13 +153,20 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
             resolution_m=request.resolution_m,
             mode=request.surface_mode,
         )
+        timings["surface_build_s"] = round(time.perf_counter() - t0, 3)
+        timings["surface"] = surface_builder.last_stats
+        t0 = time.perf_counter()
         artifact = write_surface_artifact(grid, job_dir(job_id))
+        timings["write_surface_artifact_s"] = round(time.perf_counter() - t0, 3)
         if is_cancel_requested(job_id):
             mark_cancelled(job_id, message="Ultra job cancelled after surface build.")
             return
+        t0 = time.perf_counter()
         runner_input = write_native_runner_input(artifact, job["request"], job_dir(job_id))
+        timings["write_runner_input_s"] = round(time.perf_counter() - t0, 3)
         job["surface"] = asdict(artifact)
         job["runner_input"] = asdict(runner_input)
+        job["timings"] = timings
         job["status"] = "running_native"
         job["message"] = "Running ITM/Longley-Rice over measured projected-grid terrain in tiles."
         set_progress(job, "compute", 0.4)
@@ -164,17 +177,20 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
         }
         persist_job(job_id, job)
 
+        t0 = time.perf_counter()
         native_result = _run_tiles_with_progress(
             job_id=job_id,
             artifact=artifact,
             request=job["request"],
             tiles=tiles,
         )
+        timings["native_tiles_s"] = round(time.perf_counter() - t0, 3)
         if native_result.status == "cancelled":
             mark_cancelled(job_id)
             return
         job["native_result"] = asdict(native_result)
         if native_result.status == "complete":
+            t0 = time.perf_counter()
             png_path = write_coverage_png(
                 signal_path=native_result.signal_path or "",
                 mask_path=native_result.mask_path or "",
@@ -183,12 +199,15 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
                 height=artifact.height,
                 min_dbm=request.rx_sensitivity_dbm,
             )
+            timings["render_coverage_png_s"] = round(time.perf_counter() - t0, 3)
+            t0 = time.perf_counter()
             world_path = write_png_world_file(
                 out_path=job_dir(job_id) / "coverage.pgw",
                 width=artifact.width,
                 height=artifact.height,
                 bounds_wgs84=artifact.bounds_wgs84,
             )
+            timings["write_world_file_s"] = round(time.perf_counter() - t0, 3)
             job["coverage_png"] = {"path": png_path, "world_path": world_path}
             job["status"] = "coverage_ready"
             set_progress(job, "finalize", 1.0)
@@ -203,6 +222,7 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
             job["status"] = "failed"
             set_progress(job, "finalize", 1.0)
             job["error"] = f"native ultra runner failed: {native_result.message}"
+        logger.info("ultra.job %s timings=%s", job_id, timings)
     except Exception as exc:
         job["status"] = "failed"
         set_progress(job, "finalize", 1.0)

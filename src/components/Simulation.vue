@@ -38,7 +38,7 @@
 
     <div v-if="simulation.ultra_backend" class="mt-3">
       <label for="ultra_backend_url" class="mt-label">Ultra backend URL</label>
-      <input v-model="simulation.ultra_backend_url" type="url" class="mt-input" id="ultra_backend_url" placeholder="http://127.0.0.1:8000" />
+      <input v-model="simulation.ultra_backend_url" type="url" class="mt-input" id="ultra_backend_url" :placeholder="defaultUrl" />
     </div>
   </div>
 </template>
@@ -46,7 +46,9 @@
 <script setup lang="ts">
 import { watch } from 'vue';
 import { useStore } from '../store.ts';
+import { defaultUltraBackendUrl } from '../utils.ts';
 const simulation = useStore().splatParams.simulation;
+const defaultUrl = defaultUltraBackendUrl();
 
 watch(
   () => simulation.ultra_backend,

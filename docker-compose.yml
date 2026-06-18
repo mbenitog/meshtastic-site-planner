@@ -1,12 +1,6 @@
 services:
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    environment:
-      - VIRTUAL_HOST=site.meshtastic.org
-      - VIRTUAL_PORT=80
-      - LETSENCRYPT_HOST=site.meshtastic.org
+    image: ghcr.io/mbenitog/meshtastic-site-spain:latest
     ports:
       - 8080:80
     restart: unless-stopped
@@ -14,9 +8,7 @@ services:
       - app-network
 
   ultra-backend:
-    build:
-      context: .
-      dockerfile: Dockerfile.ultra
+    image: ghcr.io/mbenitog/meshtastic-site-spain-ultra:latest
     ports:
       - 8000:8000
     volumes:
@@ -25,46 +17,8 @@ services:
     networks:
       - app-network
 
-  nginx-proxy:
-    image: nginxproxy/nginx-proxy
-    container_name: nginx-proxy
-    ports:
-      - 80:80
-      - 443:443
-    environment:
-      - TRUST_DOWNSTREAM_PROXY=true
-    volumes:
-      # The vhost and conf volumes are only required
-      # if you plan to obtain standalone certificates
-      # - vhost:/etc/nginx/vhost.d
-      # - conf:/etc/nginx/conf.d
-      - html:/usr/share/nginx/html
-      - certs:/etc/nginx/certs:ro
-      - /var/run/docker.sock:/tmp/docker.sock:ro
-    networks:
-      - app-network
-
-  acme-companion:
-    image: nginxproxy/acme-companion
-    container_name: nginx-proxy-acme
-    environment:
-      - DEFAULT_EMAIL=thebentern@meshtastic.org
-    volumes_from:
-      - nginx-proxy
-    volumes:
-      - certs:/etc/nginx/certs:rw
-      - acme:/etc/acme.sh
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - app-network
-
 networks:
   app-network:
 
 volumes:
-  # vhost:
-  # conf:
-  html:
-  certs:
-  acme:
   ultra-cache:

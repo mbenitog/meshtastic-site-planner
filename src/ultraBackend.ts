@@ -1,5 +1,6 @@
 import type { CoverageProgress, CoverageResult } from './engine/CoverageEngine';
 import type { SplatParams } from './types';
+import { defaultUltraBackendUrl } from './utils';
 
 interface UltraJobResponse {
   job_id: string;
@@ -172,7 +173,7 @@ export async function runUltraBackend(
   onProgress?: (p: CoverageProgress) => void,
   options: { surfaceMode?: UltraSurfaceMode; onJobCreated?: (jobId: string) => void } = {},
 ): Promise<UltraBackendResult> {
-  const baseUrl = params.simulation.ultra_backend_url || 'http://127.0.0.1:8000';
+  const baseUrl = params.simulation.ultra_backend_url || defaultUltraBackendUrl();
   const surfaceMode: UltraSurfaceMode = options.surfaceMode ?? 'lod_dtm_plus_buildings';
   const job = await readJson<UltraJobResponse>(joinUrl(baseUrl, '/ultra/jobs'), {
     method: 'POST',

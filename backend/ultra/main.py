@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict
 from pathlib import Path
 import json
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -20,13 +21,31 @@ from .render import write_coverage_png, write_png_world_file
 from .tiler import plan_tiles
 
 
-app = FastAPI(title="Meshtastic Site Planner Ultra DSM Backend")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+ULTRA_API_PREFIX = os.environ.get("ULTRA_API_PREFIX", "/ultra-api").rstrip("/") or ""
+ULTRA_PUBLIC_BASE_URL = os.environ.get("ULTRA_PUBLIC_BASE_URL", "").rstrip("/")
+
+
+def _public_base_url(request: Request) -> str:
+    """Return the absolute base URL the browser should use to reach this API.
+
+    Order of precedence:
+      1. ``ULTRA_PUBLIC_BASE_URL`` env var (lets operators pin a public origin
+         regardless of reverse-proxy headers).
+      2. ``X-Forwarded-Proto`` + ``X-Forwarded-Host`` from the request, so a
+         reverse proxy that preserves ``Host`` works without extra config.
+      3. The request's own scheme + host as a final fallback for direct
+         connections.
+    """
+    if ULTRA_PUBLIC_BASE_URL:
+        return ULTRA_PUBLIC_BASE_URL
+    fwd_proto = request.headers.get("x-forwarded-proto")
+    fwd_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if fwd_proto and fwd_host:
+        return f"{fwd_proto}://{fwd_host}".rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+router = APIRouter()
 ign = IgnDsmClient()
 surface_builder = SurfaceBuilder(dsm_client=ign)
 jobs: dict[str, dict] = {}
@@ -73,17 +92,18 @@ def load_job(job_id: str) -> dict | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def artifact_urls(job_id: str) -> dict[str, str]:
+def artifact_urls(job_id: str, request: Request) -> dict[str, str]:
+    base = _public_base_url(request)
     out: dict[str, str] = {}
-    base = job_dir(job_id)
+    artifact_dir = job_dir(job_id)
     for name, (filename, _) in ARTIFACT_FILES.items():
-        if (base / filename).exists():
-            out[name] = f"/ultra/jobs/{job_id}/artifacts/{name}"
+        if (artifact_dir / filename).exists():
+            out[name] = f"{base}/ultra/jobs/{job_id}/artifacts/{name}"
     return out
 
 
-def public_job(job_id: str, job: dict) -> dict:
-    return job | {"artifact_urls": artifact_urls(job_id)}
+def public_job(job_id: str, job: dict, request: Request) -> dict:
+    return job | {"artifact_urls": artifact_urls(job_id, request)}
 
 
 def set_progress(job: dict, phase: str, fraction: float) -> None:
@@ -340,12 +360,12 @@ class SurfaceSampleRequest(BaseModel):
     mode: SurfaceMode = "dtm_plus_buildings_2_5m"
 
 
-@app.get("/health")
+@router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/terrain/sample")
+@router.post("/terrain/sample")
 def terrain_sample(request: TerrainSampleRequest) -> dict:
     min_x, min_y, max_x, max_y = meter_bbox_around(request.lat, request.lon, request.radius_m)
     try:
@@ -376,7 +396,7 @@ class CoverageProbeRequest(BaseModel):
     radius_m: float = Field(..., gt=0, le=10000)
 
 
-@app.post("/coverage/probe")
+@router.post("/coverage/probe")
 def coverage_probe(request: CoverageProbeRequest) -> dict:
     """Return which IGN coverage layers are available for the bbox so the UI
     can pick a surface mode before submitting a job."""
@@ -418,7 +438,7 @@ def coverage_probe(request: CoverageProbeRequest) -> dict:
     }
 
 
-@app.post("/surface/sample")
+@router.post("/surface/sample")
 def surface_sample(request: SurfaceSampleRequest) -> dict:
     try:
         grid = surface_builder.build(
@@ -451,13 +471,13 @@ def surface_sample(request: SurfaceSampleRequest) -> dict:
     }
 
 
-@app.post("/ultra/jobs")
-def create_ultra_job(request: UltraJobRequest, background_tasks: BackgroundTasks) -> dict:
+@router.post("/ultra/jobs")
+def create_ultra_job(payload: UltraJobRequest, background_tasks: BackgroundTasks) -> dict:
     job_id = str(uuid4())
-    estimate = estimate_grid(request.radius_km, request.resolution_m)
+    estimate = estimate_grid(payload.radius_km, payload.resolution_m)
     job = {
         "status": "queued",
-        "request": request.model_dump(),
+        "request": payload.model_dump(),
         "estimate": estimate,
         "message": "Queued for tiled projected-grid ITM execution.",
         "cancel_requested": False,
@@ -465,7 +485,7 @@ def create_ultra_job(request: UltraJobRequest, background_tasks: BackgroundTasks
     set_progress(job, "terrain", 0.02)
     jobs[job_id] = job
     persist_job(job_id, job)
-    background_tasks.add_task(run_ultra_job, job_id, request)
+    background_tasks.add_task(run_ultra_job, job_id, payload)
 
     return {
         "job_id": job_id,
@@ -473,36 +493,36 @@ def create_ultra_job(request: UltraJobRequest, background_tasks: BackgroundTasks
         "message": job["message"],
         "progress": job["progress"],
         "estimate": estimate,
-        "artifact_urls": artifact_urls(job_id),
+        "artifact_urls": {},
     }
 
 
-@app.get("/ultra/jobs/{job_id}")
-def get_ultra_job(job_id: str) -> dict:
+@router.get("/ultra/jobs/{job_id}")
+def get_ultra_job(job_id: str, request: Request) -> dict:
     job = jobs.get(job_id) or load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     jobs[job_id] = job
-    return public_job(job_id, job)
+    return public_job(job_id, job, request)
 
 
-@app.post("/ultra/jobs/{job_id}/cancel")
-def cancel_ultra_job(job_id: str) -> dict:
+@router.post("/ultra/jobs/{job_id}/cancel")
+def cancel_ultra_job(job_id: str, request: Request) -> dict:
     job = jobs.get(job_id) or load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     if job.get("status") in {"coverage_ready", "failed", "cancelled"}:
         jobs[job_id] = job
-        return public_job(job_id, job)
+        return public_job(job_id, job, request)
     job["cancel_requested"] = True
     if job.get("status") == "queued":
         job["message"] = "Ultra job cancellation requested."
     jobs[job_id] = job
     persist_job(job_id, job)
-    return public_job(job_id, job)
+    return public_job(job_id, job, request)
 
 
-@app.get("/ultra/jobs/{job_id}/artifacts/{artifact}")
+@router.get("/ultra/jobs/{job_id}/artifacts/{artifact}")
 def get_ultra_artifact(job_id: str, artifact: ArtifactName) -> FileResponse:
     job = jobs.get(job_id) or load_job(job_id)
     if not job:
@@ -512,3 +532,13 @@ def get_ultra_artifact(job_id: str, artifact: ArtifactName) -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail="artifact not found")
     return FileResponse(path, media_type=media_type, filename=filename)
+
+
+app = FastAPI(title="Meshtastic Site Planner Ultra DSM Backend")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.include_router(router, prefix=ULTRA_API_PREFIX)

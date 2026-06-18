@@ -85,7 +85,7 @@ exposed on `http://127.0.0.1:8000`. Job/cache artifacts persist in the
 Probe Madrid DSM data:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/terrain/sample \
+curl -X POST http://127.0.0.1:8000/ultra-api/terrain/sample \
   -H 'content-type: application/json' \
   -d '{"lat":40.41696,"lon":-3.703508,"radius_m":25,"coverage_id":"mds05"}'
 ```
@@ -93,7 +93,7 @@ curl -X POST http://127.0.0.1:8000/terrain/sample \
 Probe the composed 2.5 m measured surface grid:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/surface/sample \
+curl -X POST http://127.0.0.1:8000/ultra-api/surface/sample \
   -H 'content-type: application/json' \
   -d '{"lat":40.41696,"lon":-3.703508,"radius_m":25,"resolution_m":2.5,"mode":"dtm_plus_buildings_2_5m"}'
 ```
@@ -102,21 +102,65 @@ Create an ultra ITM job and download output artifacts. Job creation returns
 immediately; poll the job URL until `status` is `coverage_ready`.
 
 ```bash
-curl -X POST http://127.0.0.1:8000/ultra/jobs \
+curl -X POST http://127.0.0.1:8000/ultra-api/ultra/jobs \
   -H 'content-type: application/json' \
   -d '{"lat":40.41696,"lon":-3.703508,"radius_km":0.02,"frequency_mhz":869.525,"tx_height_m":2,"rx_height_m":1,"tx_power_w":0.15,"tx_gain_dbi":3,"rx_gain_dbi":3,"rx_sensitivity_dbm":-130,"resolution_m":2.5}'
 
-curl http://127.0.0.1:8000/ultra/jobs/<job_id>
-curl -o coverage.meta.json http://127.0.0.1:8000/ultra/jobs/<job_id>/artifacts/coverage_meta
-curl -o coverage.signal_i16le.bin http://127.0.0.1:8000/ultra/jobs/<job_id>/artifacts/coverage_signal
-curl -o coverage.mask_u8.bin http://127.0.0.1:8000/ultra/jobs/<job_id>/artifacts/coverage_mask
-curl -o coverage.png http://127.0.0.1:8000/ultra/jobs/<job_id>/artifacts/coverage_png
-curl -o coverage.pgw http://127.0.0.1:8000/ultra/jobs/<job_id>/artifacts/coverage_world
+curl http://127.0.0.1:8000/ultra-api/ultra/jobs/<job_id>
+curl -o coverage.meta.json http://127.0.0.1:8000/ultra-api/ultra/jobs/<job_id>/artifacts/coverage_meta
+curl -o coverage.signal_i16le.bin http://127.0.0.1:8000/ultra-api/ultra/jobs/<job_id>/artifacts/coverage_signal
+curl -o coverage.mask_u8.bin http://127.0.0.1:8000/ultra-api/ultra/jobs/<job_id>/artifacts/coverage_mask
+curl -o coverage.png http://127.0.0.1:8000/ultra-api/ultra/jobs/<job_id>/artifacts/coverage_png
+curl -o coverage.pgw http://127.0.0.1:8000/ultra-api/ultra/jobs/<job_id>/artifacts/coverage_world
 ```
 
-Job responses include `artifact_urls` for browser clients. CORS is currently
-permissive for the prototype so the static frontend on port `8080` can call a
-backend on port `8000`.
+Job responses include absolute `artifact_urls` for browser clients, derived
+from the request's `Host` and `X-Forwarded-*` headers (or pinned with
+`ULTRA_PUBLIC_BASE_URL`). CORS is permissive for the prototype so a separate
+frontend origin can call the backend.
+
+## Mounting Under a Reverse Proxy
+
+The ultra backend mounts every route under the configurable `ULTRA_API_PREFIX`
+(env var, default `/ultra-api`). The intent is to put the API on the same
+origin as the static frontend in production through any reverse proxy. A
+minimal nginx server block:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name site.meshtastic.org;
+    # ... TLS config ...
+
+    root /var/www/meshtastic-site-planner;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /ultra-api/ {
+        proxy_pass http://127.0.0.1:8000/ultra-api/;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_read_timeout 7200s;  # long ultra jobs
+    }
+}
+```
+
+The static frontend's `Ultra backend URL` field defaults to
+`window.location.origin + "/ultra-api"`, so users opening
+`https://site.meshtastic.org/` get a working configuration with no manual
+editing. In dev (separate ports), overwrite the field with
+`http://127.0.0.1:8000/ultra-api`.
+
+Set `ULTRA_API_PREFIX=""` (empty) to mount the API at the root of the backend
+container, which is convenient for direct curl smoke tests during development.
+
+Pin the public base URL for artifact downloads with `ULTRA_PUBLIC_BASE_URL`
+when the proxy cannot supply `X-Forwarded-Proto`/`X-Forwarded-Host`.
 
 Job responses include a coarse `progress` object with `phase` values matching
 the frontend progress UI: `terrain`, `compute`, and `finalize`.

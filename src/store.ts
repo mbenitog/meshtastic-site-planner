@@ -3,7 +3,7 @@ import { defineStore } from 'pinia';
 import { randanimalSync } from 'randanimal';
 import maplibregl from 'maplibre-gl';
 import { type Site, type SplatParams } from './types.ts';
-import { cloneObject } from './utils.ts';
+import { cloneObject, defaultUltraBackendUrl } from './utils.ts';
 import { draftPinElement, sitePinElement, targetPinElement } from './layers.ts';
 import { BASEMAPS, DEFAULT_BASEMAP, applyBasemap, emptyStyle } from './map/styles.ts';
 import { BasemapControl, ExportControl, MeasureControl } from './map/controls.ts';
@@ -217,7 +217,7 @@ function defaultParams(): SplatParams {
       simulation_extent: 30.0,
       high_resolution: true,
       ultra_backend: false,
-      ultra_backend_url: 'http://127.0.0.1:8000',
+      ultra_backend_url: defaultUltraBackendUrl(),
     },
     display: { color_scale: 'plasma', min_dbm: -130.0, max_dbm: -80.0, overlay_transparency: 50 },
   };
@@ -882,7 +882,7 @@ const useStore = defineStore('store', {
       if (this.splatParams.simulation.ultra_backend && this.currentUltraJobId) {
         try {
           await cancelUltraJob(
-            this.splatParams.simulation.ultra_backend_url || 'http://127.0.0.1:8000',
+            this.splatParams.simulation.ultra_backend_url || defaultUltraBackendUrl(),
             this.currentUltraJobId,
           );
         } catch (error) {
@@ -912,7 +912,7 @@ const useStore = defineStore('store', {
 
         const result = this.splatParams.simulation.ultra_backend
           ? await (async () => {
-              const baseUrl = this.splatParams.simulation.ultra_backend_url || 'http://127.0.0.1:8000';
+              const baseUrl = this.splatParams.simulation.ultra_backend_url || defaultUltraBackendUrl();
               let surfaceMode: UltraSurfaceMode = 'lod_dtm_plus_buildings';
               try {
                 const probe = await probeUltraCoverage(

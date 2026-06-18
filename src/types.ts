@@ -16,6 +16,7 @@ export interface Site {
         coveragePngUrl?: string;
         coverageWorldUrl?: string;
         coverageMetaUrl?: string;
+        coverageCoordinates?: [[number, number], [number, number], [number, number], [number, number]];
     };
     surfaceMode?: string;
     sourceCounts?: Record<string, number>;

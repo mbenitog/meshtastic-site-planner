@@ -32,6 +32,7 @@ class SurfaceArtifact:
     min_value: float
     max_value: float
     bounds_wgs84: dict[str, float]
+    corners_wgs84: list[list[float]]
     mode: str
     source_counts: dict[str, int] = field(default_factory=dict)
 
@@ -63,11 +64,14 @@ def write_surface_artifact(grid: SurfaceGrid, out_dir: str | Path) -> SurfaceArt
         label = SOURCE_LABELS.get(int(s), "unknown")
         counts[label] = counts.get(label, 0) + 1
 
+    half = grid.resolution_m / 2.0
+    # Grid coordinates are sample centers; overlay/image corners need the
+    # outer pixel edges so the rendered image aligns with the basemap.
     corners = [
-        utm30_to_latlon(grid.min_x, grid.max_y),
-        utm30_to_latlon(grid.max_x, grid.max_y),
-        utm30_to_latlon(grid.max_x, grid.min_y),
-        utm30_to_latlon(grid.min_x, grid.min_y),
+        utm30_to_latlon(grid.min_x - half, grid.max_y + half),
+        utm30_to_latlon(grid.max_x + half, grid.max_y + half),
+        utm30_to_latlon(grid.max_x + half, grid.min_y - half),
+        utm30_to_latlon(grid.min_x - half, grid.min_y - half),
     ]
     lats = [lat for lat, _ in corners]
     lons = [lon for _, lon in corners]
@@ -90,6 +94,7 @@ def write_surface_artifact(grid: SurfaceGrid, out_dir: str | Path) -> SurfaceArt
             "east": max(lons),
             "west": min(lons),
         },
+        corners_wgs84=[[lon, lat] for lat, lon in corners],
         mode=grid.mode,
         source_counts=counts,
     )

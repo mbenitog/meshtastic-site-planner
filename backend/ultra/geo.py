@@ -1,93 +1,25 @@
-import math
+from pyproj import Transformer
+
+
+_WGS84_TO_UTM30 = Transformer.from_crs("EPSG:4326", "EPSG:25830", always_xy=True)
+_UTM30_TO_WGS84 = Transformer.from_crs("EPSG:25830", "EPSG:4326", always_xy=True)
 
 
 def latlon_to_utm30(lat_deg: float, lon_deg: float) -> tuple[float, float]:
-    """Convert WGS84/ETRS89 lon-lat to EPSG:25830-like UTM zone 30N meters.
+    """Convert WGS84 lon-lat to EPSG:25830 meters.
 
-    Spain's DSM WCS coverages use projected meter coordinates. ETRS89 and WGS84
-    differ by less than a meter for this use, so this closed-form UTM transform
-    avoids adding a heavyweight projection dependency to the prototype.
+    Use PROJ/pyproj instead of the earlier closed-form approximation so the
+    overlay georeferencing is accurate across the full zone, including eastern
+    Spain where the approximation drifted enough to visibly misalign the map.
     """
-    a = 6378137.0
-    f = 1 / 298.257223563
-    k0 = 0.9996
-    e2 = f * (2 - f)
-    ep2 = e2 / (1 - e2)
-
-    lat = math.radians(lat_deg)
-    lon = math.radians(lon_deg)
-    lon0 = math.radians(-3.0)
-    sin_lat = math.sin(lat)
-    cos_lat = math.cos(lat)
-    tan_lat = math.tan(lat)
-
-    n = a / math.sqrt(1 - e2 * sin_lat * sin_lat)
-    t = tan_lat * tan_lat
-    c = ep2 * cos_lat * cos_lat
-    aa = cos_lat * (lon - lon0)
-    m = a * (
-        (1 - e2 / 4 - 3 * e2**2 / 64 - 5 * e2**3 / 256) * lat
-        - (3 * e2 / 8 + 3 * e2**2 / 32 + 45 * e2**3 / 1024) * math.sin(2 * lat)
-        + (15 * e2**2 / 256 + 45 * e2**3 / 1024) * math.sin(4 * lat)
-        - (35 * e2**3 / 3072) * math.sin(6 * lat)
-    )
-
-    x = k0 * n * (
-        aa
-        + (1 - t + c) * aa**3 / 6
-        + (5 - 18 * t + t**2 + 72 * c - 58 * ep2) * aa**5 / 120
-    ) + 500000
-    y = k0 * (
-        m
-        + n
-        * tan_lat
-        * (
-            aa**2 / 2
-            + (5 - t + 9 * c + 4 * c**2) * aa**4 / 24
-            + (61 - 58 * t + t**2 + 600 * c - 330 * ep2) * aa**6 / 720
-        )
-    )
-    return x, y
+    x, y = _WGS84_TO_UTM30.transform(lon_deg, lat_deg)
+    return float(x), float(y)
 
 
 def utm30_to_latlon(x: float, y: float) -> tuple[float, float]:
-    """Convert EPSG:25830-like UTM zone 30N meters to WGS84 lon-lat."""
-    a = 6378137.0
-    f = 1 / 298.257223563
-    k0 = 0.9996
-    e2 = f * (2 - f)
-    ep2 = e2 / (1 - e2)
-    lon0 = math.radians(-3.0)
-
-    m = y / k0
-    mu = m / (a * (1 - e2 / 4 - 3 * e2**2 / 64 - 5 * e2**3 / 256))
-    e1 = (1 - math.sqrt(1 - e2)) / (1 + math.sqrt(1 - e2))
-    j1 = 3 * e1 / 2 - 27 * e1**3 / 32
-    j2 = 21 * e1**2 / 16 - 55 * e1**4 / 32
-    j3 = 151 * e1**3 / 96
-    j4 = 1097 * e1**4 / 512
-    fp = mu + j1 * math.sin(2 * mu) + j2 * math.sin(4 * mu) + j3 * math.sin(6 * mu) + j4 * math.sin(8 * mu)
-
-    sin_fp = math.sin(fp)
-    cos_fp = math.cos(fp)
-    tan_fp = math.tan(fp)
-    c1 = ep2 * cos_fp * cos_fp
-    t1 = tan_fp * tan_fp
-    n1 = a / math.sqrt(1 - e2 * sin_fp * sin_fp)
-    r1 = a * (1 - e2) / (1 - e2 * sin_fp * sin_fp) ** 1.5
-    d = (x - 500000) / (n1 * k0)
-
-    lat = fp - (n1 * tan_fp / r1) * (
-        d**2 / 2
-        - (5 + 3 * t1 + 10 * c1 - 4 * c1**2 - 9 * ep2) * d**4 / 24
-        + (61 + 90 * t1 + 298 * c1 + 45 * t1**2 - 252 * ep2 - 3 * c1**2) * d**6 / 720
-    )
-    lon = lon0 + (
-        d
-        - (1 + 2 * t1 + c1) * d**3 / 6
-        + (5 - 2 * c1 + 28 * t1 - 3 * c1**2 + 8 * ep2 + 24 * t1**2) * d**5 / 120
-    ) / cos_fp
-    return math.degrees(lat), math.degrees(lon)
+    """Convert EPSG:25830 meters to WGS84 lat-lon."""
+    lon, lat = _UTM30_TO_WGS84.transform(x, y)
+    return float(lat), float(lon)
 
 
 def meter_bbox_around(lat: float, lon: float, radius_m: float) -> tuple[float, float, float, float]:

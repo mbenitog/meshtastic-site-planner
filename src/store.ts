@@ -717,8 +717,15 @@ const useStore = defineStore('store', {
         this.removeOverlay(site.id);
         if (site.visible === false) return; // hidden via the site-list toggle
         const opacity = 1 - site.params.display.overlay_transparency / 100;
+        const ultraRaster =
+          site.artifacts?.coveragePngUrl && site.artifacts?.coverageCoordinates
+            ? {
+                url: site.artifacts.coveragePngUrl,
+                coordinates: site.artifacts.coverageCoordinates,
+              }
+            : null;
 
-        if (this.overlayStyle === 'contours') {
+        if (this.overlayStyle === 'contours' && !ultraRaster) {
           const geojson = coverageContours(site.result, {
             colorScale: site.params.display.color_scale,
             minDbm: site.params.display.min_dbm,
@@ -741,11 +748,13 @@ const useStore = defineStore('store', {
             paint: { 'line-color': ['get', 'color'], 'line-width': 0.6, 'line-opacity': Math.min(1, opacity + 0.25) },
           });
         } else {
-          const image = coverageImage(
-            site.result,
-            site.params.display,
-            site.params.receiver.rx_sensitivity
-          );
+          const image = ultraRaster
+            ? ultraRaster
+            : coverageImage(
+                site.result,
+                site.params.display,
+                site.params.receiver.rx_sensitivity
+              );
           map!.addSource(id, {
             type: 'image',
             url: image.url,
@@ -755,7 +764,7 @@ const useStore = defineStore('store', {
             id,
             type: 'raster',
             source: id,
-            paint: { 'raster-opacity': 1, 'raster-resampling': 'nearest' },
+            paint: { 'raster-opacity': ultraRaster ? opacity : 1, 'raster-resampling': 'nearest' },
           });
         }
       });

@@ -237,6 +237,11 @@ const buttonText = () => {
 const progressLabel = () => {
   const p = store.progress;
   if (!p) return '';
+  if (store.splatParams.simulation.ultra_backend) {
+    if (p.phase === 'terrain') return `Preparing measured surface (${Math.round(p.fraction * 100)}%)`;
+    if (p.phase === 'compute') return `Running ultra ITM tiles (${Math.round(p.fraction * 100)}%)`;
+    return 'Rendering ultra artifacts…';
+  }
   if (p.phase === 'terrain') return `Downloading terrain (${p.completed}/${p.total} tiles)`;
   if (p.phase === 'compute') return `Computing coverage (${Math.round(p.fraction * 100)}%)`;
   return 'Rendering…';

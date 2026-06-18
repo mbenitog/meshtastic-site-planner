@@ -76,6 +76,7 @@ export async function cancelUltraJob(baseUrl: string, jobId: string): Promise<vo
 
 interface UltraSurfaceMeta {
   bounds_wgs84?: CoverageResult['bounds'];
+  corners_wgs84?: [[number, number], [number, number], [number, number], [number, number]];
   mode?: string;
   source_counts?: Record<string, number>;
 }
@@ -85,6 +86,7 @@ export interface UltraBackendResult extends CoverageResult {
     coveragePngUrl?: string;
     coverageWorldUrl?: string;
     coverageMetaUrl?: string;
+    coverageCoordinates?: [[number, number], [number, number], [number, number], [number, number]];
   };
   surfaceMode?: string;
   sourceCounts?: Record<string, number>;
@@ -147,14 +149,19 @@ async function waitForUltraJob(
   signal?: AbortSignal,
   onProgress?: (p: CoverageProgress) => void
 ): Promise<UltraJobState> {
-  const deadline = Date.now() + 10 * 60 * 1000;
+  const deadline = Date.now() + 2 * 60 * 60 * 1000;
   while (Date.now() < deadline) {
     const state = await readJson<UltraJobState>(joinUrl(baseUrl, `/ultra/jobs/${jobId}`), { signal });
     emitProgress(state.progress, onProgress);
-    if (state.status === 'coverage_ready' || state.status === 'failed' || state.status === 'surface_ready') {
+    if (state.status === 'coverage_ready' || state.status === 'failed' || state.status === 'surface_ready' || state.status === 'cancelled') {
       return state;
     }
     await sleep(1500, signal);
+  }
+  try {
+    await cancelUltraJob(baseUrl, jobId);
+  } catch {
+    // Best-effort cancellation after client-side timeout.
   }
   throw new Error('Ultra backend job timed out');
 }
@@ -239,6 +246,7 @@ export async function runUltraBackend(
       coveragePngUrl: state.artifact_urls.coverage_png ? joinUrl(baseUrl, state.artifact_urls.coverage_png) : undefined,
       coverageWorldUrl: state.artifact_urls.coverage_world ? joinUrl(baseUrl, state.artifact_urls.coverage_world) : undefined,
       coverageMetaUrl: joinUrl(baseUrl, metaUrl),
+      coverageCoordinates: surfaceMeta.corners_wgs84,
     },
     surfaceMode: surfaceMeta.mode,
     sourceCounts: surfaceMeta.source_counts,

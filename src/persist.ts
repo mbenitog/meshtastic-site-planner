@@ -13,17 +13,26 @@ export const PARAMS_KEY = 'mt-site-params-v1';
  * payload from an older build still picks up any newly-added fields (and a
  * malformed section falls back to its default). Unknown top-level shapes
  * return the defaults untouched.
+ *
+ * `ultra_backend_url` is intentionally not persisted: it is always derived
+ * from the current origin + prefix so the same frontend build works behind
+ * any reverse proxy without stale dev URLs surviving a reload.
  */
 export function mergeParams(defaults: SplatParams, saved: unknown): SplatParams {
   if (!saved || typeof saved !== 'object') return defaults;
   const s = saved as Partial<Record<keyof SplatParams, unknown>>;
   const section = <T>(d: T, v: unknown): T =>
     v && typeof v === 'object' && !Array.isArray(v) ? { ...d, ...(v as object) } : d;
+  const simulationMerged = section(defaults.simulation, s.simulation);
+  const { ultra_backend_url: _ignored, ...simulation } = simulationMerged as Record<
+    string,
+    unknown
+  > & { ultra_backend_url?: unknown };
   return {
     transmitter: section(defaults.transmitter, s.transmitter),
     receiver: section(defaults.receiver, s.receiver),
     environment: section(defaults.environment, s.environment),
-    simulation: section(defaults.simulation, s.simulation),
+    simulation: { ...simulation, ultra_backend_url: defaults.simulation.ultra_backend_url },
     display: section(defaults.display, s.display),
   };
 }
@@ -43,7 +52,15 @@ export function loadParams(defaults: SplatParams): SplatParams {
 /** Persist params; silently no-ops if storage is unavailable or over quota. */
 export function saveParams(params: SplatParams): void {
   try {
-    localStorage.setItem(PARAMS_KEY, JSON.stringify(params));
+    const { ultra_backend_url: _ignored, ...rest } = params.simulation as Record<
+      string,
+      unknown
+    > & { ultra_backend_url?: unknown };
+    const payload: SplatParams = {
+      ...params,
+      simulation: rest as SplatParams['simulation'],
+    };
+    localStorage.setItem(PARAMS_KEY, JSON.stringify(payload));
   } catch {
     /* ignore: quota exceeded or storage disabled */
   }

@@ -39,4 +39,17 @@ describe('mergeParams', () => {
     const merged = mergeParams(defaults(), { receiver: [1, 2, 3] });
     expect(merged.receiver).toEqual(defaults().receiver);
   });
+
+  it('always uses the default ultra_backend_url, never the persisted one', () => {
+    const d = defaults();
+    d.simulation = {
+      ...d.simulation,
+      ultra_backend: true,
+      ultra_backend_url: 'http://127.0.0.1:8080/ultra-api',
+    } as SplatParams['simulation'];
+    const saved = { simulation: { ultra_backend_url: 'http://127.0.0.1:8000' } };
+    const merged = mergeParams(d, saved);
+    expect(merged.simulation.ultra_backend_url).toBe('http://127.0.0.1:8080/ultra-api');
+    expect(merged.simulation.ultra_backend).toBe(true);
+  });
 });

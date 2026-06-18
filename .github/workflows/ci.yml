@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, hires_spain]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build-test:

@@ -23,7 +23,7 @@ SurfaceMode = Literal[
 
 SURFACE_PROCESS_MIN_CELLS = 200_000
 SURFACE_ROW_BLOCK = 64
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass(frozen=True)

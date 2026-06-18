@@ -208,12 +208,6 @@ signal/mask files and aggregating them into the final coverage output.
 Resume after a restart is supported because tiles that already produced a file
 are skipped.
 
-Before the native ITM phase starts, the measured surface-composition step also
-uses real multi-core parallelism for large jobs by splitting the output grid
-into row blocks and processing them in multiple worker processes. This is
-configurable with `ULTRA_SURFACE_WORKERS`; by default it uses the visible CPU
-count for sufficiently large grids.
-
 A 1 km radius around Madrid (641 601 cells, 4 tiles) typically finishes in
 under a minute on a single core. Radii beyond the local IGN coverage area
 fail fast at the surface-build step instead of producing an empty grid.

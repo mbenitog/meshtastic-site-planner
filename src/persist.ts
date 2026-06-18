@@ -24,15 +24,14 @@ export function mergeParams(defaults: SplatParams, saved: unknown): SplatParams 
   const section = <T>(d: T, v: unknown): T =>
     v && typeof v === 'object' && !Array.isArray(v) ? { ...d, ...(v as object) } : d;
   const simulationMerged = section(defaults.simulation, s.simulation);
-  const { ultra_backend_url: _ignored, ...simulation } = simulationMerged as Record<
-    string,
-    unknown
-  > & { ultra_backend_url?: unknown };
   return {
     transmitter: section(defaults.transmitter, s.transmitter),
     receiver: section(defaults.receiver, s.receiver),
     environment: section(defaults.environment, s.environment),
-    simulation: { ...simulation, ultra_backend_url: defaults.simulation.ultra_backend_url },
+    simulation: {
+      ...simulationMerged,
+      ultra_backend_url: defaults.simulation.ultra_backend_url,
+    },
     display: section(defaults.display, s.display),
   };
 }
@@ -49,17 +48,18 @@ export function loadParams(defaults: SplatParams): SplatParams {
   return defaults;
 }
 
-/** Persist params; silently no-ops if storage is unavailable or over quota. */
+/** Persist params; silently no-ops if storage is unavailable or over quota.
+ *
+ * `ultra_backend_url` is intentionally omitted: it is derived from the current
+ * origin + prefix on every load (see `mergeParams` and `defaultUltraBackendUrl`)
+ * so the same frontend build works behind any reverse proxy without stale dev
+ * URLs surviving a reload.
+ */
 export function saveParams(params: SplatParams): void {
   try {
-    const { ultra_backend_url: _ignored, ...rest } = params.simulation as Record<
-      string,
-      unknown
-    > & { ultra_backend_url?: unknown };
-    const payload: SplatParams = {
-      ...params,
-      simulation: rest as SplatParams['simulation'],
-    };
+    const { ultra_backend_url: _ignored, ...simulation } = params.simulation;
+    void _ignored;
+    const payload: SplatParams = { ...params, simulation };
     localStorage.setItem(PARAMS_KEY, JSON.stringify(payload));
   } catch {
     /* ignore: quota exceeded or storage disabled */

@@ -109,6 +109,7 @@ const POLARIZATION: Record<string, number> = {
 };
 
 function joinUrl(base: string, path: string): string {
+  if (/^https?:\/\//i.test(path)) return path;
   return `${base.replace(/\/$/, '')}${path}`;
 }
 

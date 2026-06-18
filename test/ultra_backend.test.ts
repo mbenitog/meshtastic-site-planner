@@ -76,9 +76,9 @@ describe('runUltraBackend', () => {
           job_id: 'abc',
           status: 'coverage_ready',
           artifact_urls: {
-            coverage_meta: '/ultra/jobs/abc/artifacts/coverage_meta',
-            surface_meta: '/ultra/jobs/abc/artifacts/surface_meta',
-            coverage_signal: '/ultra/jobs/abc/artifacts/coverage_signal',
+            coverage_meta: 'http://ultra.test/ultra-api/ultra/jobs/abc/artifacts/coverage_meta',
+            surface_meta: 'http://ultra.test/ultra-api/ultra/jobs/abc/artifacts/surface_meta',
+            coverage_signal: 'http://ultra.test/ultra-api/ultra/jobs/abc/artifacts/coverage_signal',
           },
         });
       }
@@ -109,6 +109,7 @@ describe('runUltraBackend', () => {
     expect(calls[0].body.radio_climate).toBe(5); // continental_temperate
     expect(calls[0].body.polarization).toBe(1); // vertical
     expect(calls[0].body.confidence).toBeCloseTo(0.95, 6);
+    expect(result.artifacts.coverageMetaUrl).toBe('http://ultra.test/ultra-api/ultra/jobs/abc/artifacts/coverage_meta');
   });
 
   it('throws when the backend job fails', async () => {

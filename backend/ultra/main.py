@@ -93,12 +93,13 @@ def load_job(job_id: str) -> dict | None:
 
 
 def artifact_urls(job_id: str, request: Request) -> dict[str, str]:
-    base = _public_base_url(request)
     out: dict[str, str] = {}
     artifact_dir = job_dir(job_id)
     for name, (filename, _) in ARTIFACT_FILES.items():
         if (artifact_dir / filename).exists():
-            out[name] = f"{base}/ultra/jobs/{job_id}/artifacts/{name}"
+            out[name] = str(
+                request.url_for("get_ultra_artifact", job_id=job_id, artifact=name)
+            )
     return out
 
 

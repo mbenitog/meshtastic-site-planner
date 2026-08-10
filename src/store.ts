@@ -10,13 +10,20 @@ import { BasemapControl, ExportControl, MeasureControl } from './map/controls.ts
 import { SearchControl } from './map/search.ts';
 import { coverageImage, cropToRadius } from './map/overlay.ts';
 import { coverageContours } from './map/contours.ts';
-import { exportGeoJSON, exportKml, exportPngWorldFile } from './map/export.ts';
+import { canShareFiles, exportGeoJSON, exportKml, exportPngWorldFile, postCoverageToBridge, shareGeoJSON } from './map/export.ts';
 import type { WasmCoverageEngine } from './engine/WasmCoverageEngine.ts';
 import type { CoverageProgress } from './engine/CoverageEngine.ts';
 import { toEngineParams, type CoverageRequest, METERS_PER_FOOT, MAX_RADIUS_METERS } from './engine/params.ts';
 import { analyzeLink, type LinkAnalysis } from './engine/link.ts';
 import { loadParams, mergeParams, saveParams } from './persist.ts';
-import { decodeSharedHash, buildShareUrl, clearSharedHash } from './permalink.ts';
+import {
+  decodeSharedHash,
+  decodeSharedQuery,
+  sharedRunRequested,
+  buildShareUrl,
+  clearSharedHash,
+  clearSharedQuery,
+} from './permalink.ts';
 import { coverageStats } from './coverageStats.ts';
 import { TerrainService } from './terrain/TerrainService.ts';
 import { cancelUltraJob, runUltraBackend, probeUltraCoverage, type UltraSurfaceMode } from './ultraBackend.ts';
@@ -137,6 +144,7 @@ function buildSitePopup(site: Site): HTMLElement {
       <button type="button" data-fmt="geojson">GeoJSON</button>
       <button type="button" data-fmt="png">PNG</button>
       <button type="button" data-fmt="kml">KML</button>
+      ${canShareFiles() ? '<button type="button" data-fmt="share">Send to App</button>' : ''}
     </div>`;
   el.querySelectorAll<HTMLButtonElement>('button[data-fmt]').forEach((b) =>
     b.addEventListener('click', () => {
@@ -144,6 +152,7 @@ function buildSitePopup(site: Site): HTMLElement {
       if (fmt === 'geojson') exportGeoJSON(site);
       else if (fmt === 'png') void exportPngWorldFile(site);
       else if (fmt === 'kml') void exportKml(site);
+      else if (fmt === 'share') void shareGeoJSON(site);
     })
   );
   if (site.artifacts?.coveragePngUrl) {
@@ -227,8 +236,17 @@ function defaultParams(): SplatParams {
  * (#12), which win over the factory defaults. */
 function initialParams(): SplatParams {
   const d = defaultParams();
-  const shared = decodeSharedHash();
-  return shared ? mergeParams(d, shared) : loadParams(d);
+  const cfg = decodeSharedHash();
+  const query = decodeSharedQuery();
+  // An explicit deep link — a shared #cfg permalink (#9) or the flat ?lat=&lon=…
+  // app hand-off — wins over persisted params (#12); cfg is the base and the
+  // query overrides it, so `#cfg=…` and `?lat=…` can be combined.
+  if (cfg || query) {
+    let p = cfg ? mergeParams(d, cfg) : d;
+    if (query) p = mergeParams(p, query);
+    return p;
+  }
+  return loadParams(d);
 }
 
 const useStore = defineStore('store', {
@@ -253,6 +271,9 @@ const useStore = defineStore('store', {
       highpointMessage: '' as string,
       // Restore from a shared link (#9) or the last-used params (#12).
       splatParams: initialParams(),
+      /** App hand-off: run coverage as soon as the map is ready (#cfg/?run=1).
+       * Captured at store creation, before consumeSharedLink() clears the URL. */
+      autoRun: sharedRunRequested(),
       /** Transient "Copied!" feedback for the share button (#9). */
       shareCopied: false,
       /** Measure/ruler tool (#15). */
@@ -543,9 +564,10 @@ const useStore = defineStore('store', {
     /** If the page opened from a shared link, persist those params and drop the
      * hash so later edits aren't overridden by the link on the next reload. */
     consumeSharedLink() {
-      if (decodeSharedHash()) {
+      if (decodeSharedHash() || decodeSharedQuery()) {
         saveParams(this.splatParams);
         clearSharedHash();
+        clearSharedQuery();
       }
     },
 
@@ -817,6 +839,12 @@ const useStore = defineStore('store', {
         if (!map) return;
         applyBasemap(map, DEFAULT_BASEMAP);
         this.syncOverlays();
+        // App hand-off (#cfg/?run=1): compute coverage once the map is ready, so
+        // the resulting overlay and site marker have somewhere to attach.
+        if (this.autoRun) {
+          this.autoRun = false;
+          void this.runSimulation();
+        }
       });
 
       // Tap a contour band to read its signal level (vector-only). Querying
@@ -984,9 +1012,13 @@ const useStore = defineStore('store', {
           siteMarkers.set(id, marker);
         }
 
-        this.splatParams.transmitter.name = randanimalSync();
         this.syncOverlays();
         this.simulationState = 'completed';
+        // Headless/native hand-off (Android WebView): push the styled GeoJSON to
+        // the injected bridge, before the name is randomized below, so it carries
+        // the source site's name. No-op in a normal browser.
+        postCoverageToBridge(site);
+        this.splatParams.transmitter.name = randanimalSync();
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') {
           console.log('Simulation cancelled');

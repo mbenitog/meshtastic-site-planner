@@ -53,14 +53,14 @@ def write_surface_artifact(grid: SurfaceGrid, out_dir: str | Path) -> SurfaceArt
     meta_path = out / "surface_meta.json"
 
     with surface_path.open("wb") as fp:
-        for value in grid.values:
+        for value in grid.values.flat:
             fp.write(struct.pack("<h", max(-32768, min(32767, round(value)))))
-    if grid.sources:
+    if grid.sources.size:
         with sources_path.open("wb") as fp:
-            fp.write(bytes(grid.sources))
+            fp.write(grid.sources.tobytes())
 
     counts: dict[str, int] = {label: 0 for label in SOURCE_LABELS.values()}
-    for s in grid.sources:
+    for s in grid.sources.flat:
         label = SOURCE_LABELS.get(int(s), "unknown")
         counts[label] = counts.get(label, 0) + 1
 

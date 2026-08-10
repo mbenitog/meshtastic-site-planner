@@ -10,12 +10,14 @@ import json
 import subprocess
 import math
 
+import numpy as np
+
 
 API_COVERAGES_URL = "https://api-coverages.idee.es/collections"
 DTM_5M_25830 = "EL.ElevationGridCoverage_25830_5_PB"
 
 
-@dataclass(frozen=True)
+@dataclass
 class CoverageGrid:
     width: int
     height: int
@@ -24,6 +26,57 @@ class CoverageGrid:
     min_y: float
     max_y: float
     values: list[float | None]
+
+    def __post_init__(self) -> None:
+        # Precompute numpy views used by the hot path so the per-cell
+        # inner loop in SurfaceBuilder.build can do a single O(1) lookup
+        # instead of a per-call O(width*height) scan when the cell is None.
+        #
+        # _values_arr: original values with None replaced by NaN. Used by
+        # min/max_value and preserved exactly: a cell that was None stays
+        # NaN so we can distinguish "no data" from "real 0 m".
+        # _valid: boolean mask of cells that had a real value originally.
+        # _filled: _values_arr with every None cell filled from the nearest
+        # non-null neighbour. This is what sample_nearest returns.
+        #
+        # The fill is a 2-pass scan (top->bottom then left->right,
+        # bottom->top then right->left) instead of an exact Euclidean
+        # nearest-neighbour fill (which would require scipy.ndimage
+        # .distance_transform_edt). The 2-pass is O(N) total, propagates
+        # from any direction, and is good enough for terrain
+        # interpolation since missing data only appears at IGN bbox edges.
+        arr = np.array(
+            [np.nan if v is None else float(v) for v in self.values],
+            dtype=np.float64,
+        ).reshape(self.height, self.width)
+        valid = ~np.isnan(arr)
+        filled = arr.copy()
+        if not bool(valid.all()):
+            # Pass 1: top then left (propagates valid rows/columns inward).
+            shifted = filled[1:, :]
+            mask = (~valid[1:, :]) & valid[:-1, :]
+            shifted[mask] = filled[:-1, :][mask]
+            filled[1:, :] = shifted
+            valid[1:, :] |= valid[:-1, :]
+            shifted = filled[:, 1:]
+            mask = (~valid[:, 1:]) & valid[:, :-1]
+            shifted[mask] = filled[:, :-1][mask]
+            filled[:, 1:] = shifted
+            valid[:, 1:] |= valid[:, :-1]
+            # Pass 2: bottom then right.
+            shifted = filled[:-1, :]
+            mask = (~valid[:-1, :]) & valid[1:, :]
+            shifted[mask] = filled[1:, :][mask]
+            filled[:-1, :] = shifted
+            valid[:-1, :] |= valid[1:, :]
+            shifted = filled[:, :-1]
+            mask = (~valid[:, :-1]) & valid[:, 1:]
+            shifted[mask] = filled[:, 1:][mask]
+            filled[:, :-1] = shifted
+            valid[:, :-1] |= valid[:, 1:]
+        self._values_arr = arr
+        self._valid = valid
+        self._filled = filled
 
     @property
     def dx(self) -> float:
@@ -35,46 +88,38 @@ class CoverageGrid:
 
     @property
     def min_value(self) -> float:
-        vals = [v for v in self.values if v is not None]
-        return min(vals) if vals else 0.0
+        if not bool(self._valid.any()):
+            return 0.0
+        return float(np.nanmin(self._values_arr))
 
     @property
     def max_value(self) -> float:
-        vals = [v for v in self.values if v is not None]
-        return max(vals) if vals else 0.0
+        if not bool(self._valid.any()):
+            return 0.0
+        return float(np.nanmax(self._values_arr))
+
+    def _col(self, x: float) -> int:
+        if self.width == 1:
+            return 0
+        return min(max(int(round((x - self.min_x) / self.dx)), 0), self.width - 1)
+
+    def _row(self, y: float) -> int:
+        if self.height == 1:
+            return 0
+        # CoverageJSON from this API returns y axis high-to-low for EPSG:25830.
+        if self.max_y >= self.min_y:
+            raw = round((self.max_y - y) / abs(self.dy))
+        else:
+            raw = round((y - self.max_y) / abs(self.dy))
+        return min(max(int(raw), 0), self.height - 1)
 
     def sample_nearest(self, x: float, y: float) -> float:
-        if self.width == 1:
-            ix = 0
-        else:
-            ix = round((x - self.min_x) / self.dx)
-        if self.height == 1:
-            iy = 0
-        else:
-            # CoverageJSON from this API returns y axis high-to-low for EPSG:25830.
-            if self.max_y >= self.min_y:
-                iy = round((self.max_y - y) / abs(self.dy))
-            else:
-                iy = round((y - self.max_y) / abs(self.dy))
-        ix = min(max(int(ix), 0), self.width - 1)
-        iy = min(max(int(iy), 0), self.height - 1)
-        value = self.values[iy * self.width + ix]
-        if value is not None:
-            return value
-        # Fill sparse null cells from the nearest measured neighbour. This is
-        # preferable to creating artificial 0 m terrain holes in the RF surface.
-        best: tuple[int, float] | None = None
-        for j in range(self.height):
-            for i in range(self.width):
-                candidate = self.values[j * self.width + i]
-                if candidate is None:
-                    continue
-                dist2 = (i - ix) * (i - ix) + (j - iy) * (j - iy)
-                if best is None or dist2 < best[0]:
-                    best = (dist2, candidate)
-        if best is None:
+        ix = self._col(x)
+        iy = self._row(y)
+        value = float(self._filled[iy, ix])
+        if math.isnan(value):
             return 0.0
-        return best[1]
+        return value
 
 
 def _cache_key(params: dict[str, str]) -> str:

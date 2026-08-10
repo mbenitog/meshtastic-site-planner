@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import asdict
 from pathlib import Path
 import json
@@ -51,6 +52,7 @@ surface_builder = SurfaceBuilder(dsm_client=ign)
 jobs: dict[str, dict] = {}
 JOB_ROOT = Path(".cache/ultra-jobs")
 TILE_MAX_CELLS = 250_000
+SINGLE_TILE_CELL_THRESHOLD = 1_000_000
 ArtifactName = Literal[
     "job",
     "surface",
@@ -211,18 +213,64 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
     persist_job(job_id, job)
 
 
+def _run_one_tile(
+    binary: str,
+    artifact_dict: dict,
+    tile_dict: dict,
+    request: dict,
+    tx_x: float,
+    tx_y: float,
+    out_prefix: str,
+    threads: int,
+) -> None:
+    """ProcessPoolExecutor worker: build the per-tile command and run it.
+
+    Module-level (not a closure) so the executor can pickle it across
+    process boundaries. All inputs are plain picklable types; the dataclass
+    shapes are reconstructed from ``asdict(...)`` snapshots.
+    """
+    import subprocess
+    from pathlib import Path
+    from .artifacts import SurfaceArtifact
+    from .tiler import TileSpec
+    from .runner import _build_cmd
+
+    artifact = SurfaceArtifact(**artifact_dict)
+    tile = TileSpec(**tile_dict)
+    cmd = _build_cmd(
+        Path(binary),
+        artifact,
+        tile,
+        request,
+        tx_x,
+        tx_y,
+        Path(out_prefix),
+        threads=threads,
+    )
+    subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+
+
 def _run_tiles_with_progress(job_id, artifact, request, tiles):
     """Run the tiled native runner, persisting tile-level progress into the
     in-memory job after each completed tile so the polling client sees a
-    live fraction."""
-    from .runner import run_tiled_native_ultra
-    from .tiler import TileSpec
-    # Inline the per-tile loop here so we can write per-tile progress; the
-    # helper still owns the final aggregation step.
+    live fraction.
+
+    Picks one of two paths based on grid size:
+
+    * Single-process path (``workers == 1``): one subprocess per tile, all
+      cores available to the C++ runner via ``--threads cpu_count``. Used for
+      small grids (under :data:`SINGLE_TILE_CELL_THRESHOLD` cells or a single
+      pending tile) where the per-process startup cost would dominate.
+    * Multi-process path: :class:`ProcessPoolExecutor` fans the tiles out
+      across ``min(cpu_count, len(pending_tiles))`` workers, with each
+      subprocess sized to ``max(1, cpu_count // workers)`` threads so the
+      total threads across workers stays close to ``cpu_count`` (no
+      oversubscription).
+    """
     import os
     import subprocess
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     from pathlib import Path
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     binary = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli")).resolve()
     if not binary.exists():
@@ -237,59 +285,117 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
     out_dir.mkdir(parents=True, exist_ok=True)
     out_prefix = out_dir / "coverage"
     from .geo import latlon_to_utm30
-    from .runner import _build_cmd
+    from .runner import _build_cmd, NativeRunResult
 
     tx_x, tx_y = latlon_to_utm30(request["lat"], request["lon"])
     total = len(tiles)
-    workers = min(
-        max(1, int(os.environ.get("ULTRA_TILE_WORKERS", max(1, (os.cpu_count() or 1) // 2)))),
-        max(1, len(tiles)),
-        4,
-    )
-    job = jobs.get(job_id)
-    if job is not None:
-        job.setdefault("tiles", {})["workers"] = workers
-        persist_job(job_id, job)
+    cpu_count = os.cpu_count() or 1
+    total_cells = artifact.width * artifact.height
 
     pending_tiles = []
     for tile in tiles:
         sig_path = out_dir / f"coverage_x{tile.x0}_y{tile.y0}.signal_i16le.bin"
         if sig_path.exists():
-            _advance_tile_progress(job_id, total)
+            _advance_tile_progress_throttled(job_id, total)
         else:
             pending_tiles.append(tile)
 
-    for batch_start in range(0, len(pending_tiles), workers):
-        if is_cancel_requested(job_id):
-            from .runner import NativeRunResult
-            return NativeRunResult(
-                status="cancelled",
-                model="itm_projected_grid",
-                message="Ultra job cancelled during tiled native execution.",
+    if total_cells <= SINGLE_TILE_CELL_THRESHOLD or len(pending_tiles) <= 1:
+        workers = 1
+        threads_per_call = cpu_count
+    else:
+        env_workers = os.environ.get("ULTRA_TILE_WORKERS")
+        if env_workers is not None:
+            workers = min(
+                max(1, int(env_workers)),
+                max(1, len(pending_tiles)),
             )
-        batch = pending_tiles[batch_start : batch_start + workers]
+        else:
+            workers = min(cpu_count, len(pending_tiles))
+        threads_per_call = max(1, cpu_count // workers)
 
-        def run_tile(tile):
-            cmd = _build_cmd(binary, artifact, tile, request, tx_x, tx_y, out_prefix)
-            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
-            return tile
+    job = jobs.get(job_id)
+    if job is not None:
+        tiles_meta = job.setdefault("tiles", {})
+        tiles_meta["workers"] = workers
+        tiles_meta["threads_per_call"] = threads_per_call
+        persist_job(job_id, job)
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_map = {executor.submit(run_tile, tile): tile for tile in batch}
-            for future in as_completed(future_map):
-                tile = future_map[future]
+    if is_cancel_requested(job_id):
+        return NativeRunResult(
+            status="cancelled",
+            model="itm_projected_grid",
+            message="Ultra job cancelled during tiled native execution.",
+        )
+
+    if workers == 1:
+        for tile in pending_tiles:
+            if is_cancel_requested(job_id):
+                return NativeRunResult(
+                    status="cancelled",
+                    model="itm_projected_grid",
+                    message="Ultra job cancelled during tiled native execution.",
+                )
+            cmd = _build_cmd(
+                binary,
+                artifact,
+                tile,
+                request,
+                tx_x,
+                tx_y,
+                out_prefix,
+                threads=threads_per_call,
+            )
+            try:
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+            except Exception as exc:
+                return NativeRunResult(
+                    status="failed",
+                    model="itm_projected_grid",
+                    message=f"tile ({tile.x0},{tile.y0}) failed: {exc}",
+                )
+            _advance_tile_progress_throttled(job_id, total)
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            future_to_tile = {
+                executor.submit(
+                    _run_one_tile,
+                    str(binary),
+                    asdict(artifact),
+                    asdict(tile),
+                    request,
+                    tx_x,
+                    tx_y,
+                    str(out_prefix),
+                    threads_per_call,
+                ): tile
+                for tile in pending_tiles
+            }
+            for future in as_completed(future_to_tile):
+                tile = future_to_tile[future]
                 try:
                     future.result()
                 except Exception as exc:
-                    from .runner import NativeRunResult
                     return NativeRunResult(
                         status="failed",
                         model="itm_projected_grid",
                         message=f"tile ({tile.x0},{tile.y0}) failed: {exc}",
                     )
-                _advance_tile_progress(job_id, total)
+                _advance_tile_progress_throttled(job_id, total)
+                if is_cancel_requested(job_id):
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return NativeRunResult(
+                        status="cancelled",
+                        model="itm_projected_grid",
+                        message="Ultra job cancelled during tiled native execution.",
+                    )
 
-    # Aggregation step is the same as the helper.
     return run_tiled_native_ultra(
         artifact=artifact,
         request=request,
@@ -307,6 +413,32 @@ def _advance_tile_progress(job_id: str, total: int) -> None:
     fraction = 0.4 + 0.5 * (done / max(1, total))
     set_progress(job, "compute", fraction)
     persist_job(job_id, job)
+
+
+def _advance_tile_progress_throttled(
+    job_id: str, total: int, *, min_interval_s: float = 0.25,
+) -> None:
+    """Like :func:`_advance_tile_progress` but coalesces disk writes.
+
+    The in-memory ``job`` dict is updated on every call (cheap), but the
+    expensive ``persist_job`` rewrite only fires when at least
+    ``min_interval_s`` seconds have passed since the last persist, or when
+    this is the final tile (so the on-disk state always reflects completion).
+    """
+    job = jobs.get(job_id)
+    if not job:
+        return
+    done = int(job.get("tiles", {}).get("completed", 0)) + 1
+    tiles_meta = job.setdefault("tiles", {})
+    tiles_meta["completed"] = done
+    fraction = 0.4 + 0.5 * (done / max(1, total))
+    set_progress(job, "compute", fraction)
+    now = time.monotonic()
+    last = tiles_meta.get("last_persist_ts")
+    is_last = done >= total
+    if last is None or (now - last) >= min_interval_s or is_last:
+        persist_job(job_id, job)
+        tiles_meta["last_persist_ts"] = now
 
 
 def estimate_grid(radius_km: float, resolution_m: float) -> dict[str, float | int]:

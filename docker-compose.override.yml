@@ -1,0 +1,30 @@
+services:
+  app:
+    image: meshtastic-site-planner:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - 8080:80
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  ultra-backend:
+    image: meshtastic-site-planner-ultra:local
+    build:
+      context: .
+      dockerfile: Dockerfile.ultra
+    ports:
+      - 8000:8000
+    volumes:
+      - ultra-cache:/app/.cache
+    restart: unless-stopped
+    networks:
+      - app-network
+
+networks:
+  app-network:
+
+volumes:
+  ultra-cache:

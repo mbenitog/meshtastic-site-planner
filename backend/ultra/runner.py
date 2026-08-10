@@ -155,8 +155,10 @@ def _build_cmd(
     tx_x: float,
     tx_y: float,
     out_prefix: Path,
+    *,
+    threads: int | None = None,
 ) -> list[str]:
-    return [
+    cmd = [
         str(binary),
         "--surface",
         artifact.path,
@@ -213,6 +215,9 @@ def _build_cmd(
         "--rel",
         str(request["reliability"]),
     ]
+    if threads is not None:
+        cmd.extend(["--threads", str(threads)])
+    return cmd
 
 
 def run_native_ultra(

@@ -1,6 +1,6 @@
 <template>
   <div>
-    <p class="mt-hint mb-3">The nodes that should hear this site (-130 dBm matches the default LongFast preset).</p>
+    <p class="mt-hint mb-3">The nodes that should hear this site.</p>
     <div class="grid grid-cols-2 gap-2">
       <div>
         <label for="rx_sensitivity" class="mt-label">Sensitivity (dBm)</label>

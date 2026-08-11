@@ -211,7 +211,7 @@ function defaultParams(): SplatParams {
       tx_height: 2.0,
       tx_gain: 3.0,
     },
-    receiver: { rx_sensitivity: -130.0, rx_height: 1.0, rx_gain: 3.0, rx_loss: 2.0 },
+    receiver: { rx_sensitivity: -127.0, rx_height: 1.0, rx_gain: 3.0, rx_loss: 2.0 },
     environment: {
       radio_climate: 'continental_temperate',
       polarization: 'vertical',
@@ -228,7 +228,7 @@ function defaultParams(): SplatParams {
       ultra_backend: false,
       ultra_backend_url: defaultUltraBackendUrl(),
     },
-    display: { color_scale: 'plasma', min_dbm: -130.0, max_dbm: -80.0, overlay_transparency: 50 },
+    display: { color_scale: 'plasma', min_dbm: -127.0, max_dbm: -80.0, overlay_transparency: 50 },
   };
 }
 

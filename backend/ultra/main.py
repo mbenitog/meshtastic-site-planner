@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+import multiprocessing
 import os
+import signal
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
-import json
 from typing import Literal
 from uuid import uuid4
 
@@ -16,8 +19,8 @@ from pydantic import BaseModel, Field
 from .geo import meter_bbox_around
 from .ign_dsm import IgnDsmClient
 from .surface import SurfaceBuilder, SurfaceMode
-from .artifacts import write_surface_artifact
-from .runner import run_tiled_native_ultra, write_native_runner_input
+from .artifacts import SurfaceArtifact
+from .runner import NativeRunnerInput, run_tiled_native_ultra
 from .render import write_coverage_png, write_png_world_file
 from .tiler import plan_tiles
 
@@ -53,6 +56,58 @@ jobs: dict[str, dict] = {}
 JOB_ROOT = Path(".cache/ultra-jobs")
 TILE_MAX_CELLS = 250_000
 SINGLE_TILE_CELL_THRESHOLD = 1_000_000
+
+# Cross-process registry of in-flight C++ subprocesses (ultra_cli) keyed by
+# job_id. Backed by a multiprocessing.Manager so that worker processes
+# spawned by ProcessPoolExecutor can register their children's PIDs and the
+# main process can SIGTERM/SIGKILL them when cancel is requested. The
+# Manager is created lazily because Manager() spawns a server process.
+_active_pids_manager: multiprocessing.managers.SyncManager | None = None
+_active_pids_by_job: dict | None = None  # Manager dict: job_id -> Manager list of int PIDs
+_pids_registry_lock = threading.Lock()
+
+
+def _ensure_pids_registry() -> dict:
+    global _active_pids_manager, _active_pids_by_job
+    with _pids_registry_lock:
+        if _active_pids_manager is None:
+            _active_pids_manager = multiprocessing.Manager()
+            _active_pids_by_job = _active_pids_manager.dict()
+    return _active_pids_by_job
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _terminate_job_subprocesses(job_id: str, *, grace_s: float = 3.0) -> None:
+    """Send SIGTERM to every registered PID for the job, then SIGKILL to any
+    that are still alive after grace_s. Safe to call when the job has no
+    registered PIDs (no-op)."""
+    registry = _ensure_pids_registry()
+    pids = list(registry.get(job_id, []))  # snapshot
+    if not pids:
+        return
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        if all(_pid_alive(pid) is False for pid in pids):
+            break
+        time.sleep(0.1)
+    for pid in pids:
+        if _pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
 ArtifactName = Literal[
     "job",
     "surface",
@@ -114,7 +169,17 @@ def set_progress(job: dict, phase: str, fraction: float) -> None:
 
 
 def is_cancel_requested(job_id: str) -> bool:
-    job = jobs.get(job_id) or load_job(job_id)
+    """Return True if cancel was requested for this job.
+
+    Checks the on-disk job.json first because worker processes spawned by
+    ProcessPoolExecutor have a stale snapshot of the in-memory ``jobs``
+    dict (from fork time) and do not see cancellations made after the
+    worker was spawned. The cancel handler always ``persist_job``s before
+    terminating subprocesses, so the disk is the cross-process source of
+    truth. The in-memory dict is checked as a fast-path for the main
+    process.
+    """
+    job = load_job(job_id) or jobs.get(job_id)
     return bool(job and job.get("cancel_requested"))
 
 
@@ -127,6 +192,78 @@ def mark_cancelled(job_id: str, *, message: str = "Ultra job cancelled.") -> Non
     set_progress(job, "finalize", 1.0)
     jobs[job_id] = job
     persist_job(job_id, job)
+
+
+def _run_surface_subprocess(
+    job_id: str, request: dict, out_dir: Path
+) -> tuple[SurfaceArtifact | None, NativeRunnerInput | None, str | None]:
+    """Build the surface in a separate Python subprocess so the cancel endpoint
+    can SIGTERM it during the (otherwise non-interruptible) HTTP fetches and
+    numpy vectorization of the ``building_surface`` phase. Returns
+    ``(artifact, runner_input, error)``; on cancellation, ``artifact`` and
+    ``runner_input`` are ``None`` and ``error`` starts with ``"cancelled"``.
+    """
+    import subprocess
+    import sys as _sys
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload_file = out_dir / "surface_payload.json"
+    payload_file.write_text(
+        json.dumps({"request": dict(request), "out_dir": str(out_dir)}),
+        encoding="utf-8",
+    )
+
+    cmd = [_sys.executable, "-m", "backend.ultra.surface_worker", str(payload_file)]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    registry = _ensure_pids_registry()
+    job_pid_list = registry.setdefault(job_id, _active_pids_manager.list())
+    job_pid_list.append(proc.pid)
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            return None, None, f"surface build timed out after 300s"
+
+        if proc.returncode != 0:
+            # If cancel was requested, the SIGTERM was what killed us; return
+            # as cancelled rather than failed. The main process polls
+            # is_cancel_requested (disk-backed) which returns True now.
+            if is_cancel_requested(job_id):
+                return None, None, "cancelled by user"
+            # Surface the subprocess's traceback if it left one.
+            error_trace = out_dir / "surface_error.txt"
+            detail = (
+                error_trace.read_text(encoding="utf-8")
+                if error_trace.exists()
+                else (stderr or stdout or "")[:500]
+            )
+            return None, None, f"surface build failed (rc={proc.returncode}): {detail}"
+    finally:
+        try:
+            job_pid_list.remove(proc.pid)
+        except ValueError:
+            pass
+
+    done_file = out_dir / "surface_done.flag"
+    if not done_file.exists():
+        # No marker: subprocess was killed by SIGTERM before writing it.
+        return None, None, "cancelled by user"
+
+    meta = json.loads((out_dir / "surface_meta.json").read_text(encoding="utf-8"))
+    artifact = SurfaceArtifact(**meta)
+    runner_input_dict = json.loads(
+        (out_dir / "runner_input.json").read_text(encoding="utf-8")
+    )
+    runner_input = NativeRunnerInput(**runner_input_dict)
+    return artifact, runner_input, None
 
 
 def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
@@ -142,18 +279,24 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
     jobs[job_id] = job
     persist_job(job_id, job)
     try:
-        grid = surface_builder.build(
-            lat=request.lat,
-            lon=request.lon,
-            radius_m=request.radius_km * 1000,
-            resolution_m=request.resolution_m,
-            mode=request.surface_mode,
+        artifact, runner_input, surface_error = _run_surface_subprocess(
+            job_id=job_id,
+            request=job["request"],
+            out_dir=job_dir(job_id),
         )
-        artifact = write_surface_artifact(grid, job_dir(job_id))
-        if is_cancel_requested(job_id):
-            mark_cancelled(job_id, message="Ultra job cancelled after surface build.")
+        if artifact is None:
+            if surface_error and surface_error.startswith("cancelled"):
+                mark_cancelled(
+                    job_id,
+                    message="Ultra job cancelled during surface build.",
+                )
+                return
+            job["status"] = "failed"
+            set_progress(job, "finalize", 1.0)
+            job["error"] = surface_error or "surface build failed"
+            jobs[job_id] = job
+            persist_job(job_id, job)
             return
-        runner_input = write_native_runner_input(artifact, job["request"], job_dir(job_id))
         job["surface"] = asdict(artifact)
         job["runner_input"] = asdict(runner_input)
         job["status"] = "running_native"
@@ -222,18 +365,34 @@ def _run_one_tile(
     tx_y: float,
     out_prefix: str,
     threads: int,
+    job_id: str,
+    pid_registry: dict,
 ) -> None:
     """ProcessPoolExecutor worker: build the per-tile command and run it.
 
     Module-level (not a closure) so the executor can pickle it across
     process boundaries. All inputs are plain picklable types; the dataclass
     shapes are reconstructed from ``asdict(...)`` snapshots.
+
+    The worker's C++ child PID is registered in ``pid_registry[job_id]``
+    (a Manager list proxy) so the main process can SIGTERM/SIGKILL it on
+    cancel. We use ``Popen`` + ``communicate(timeout=...)`` instead of
+    ``subprocess.run`` so the cancel endpoint can interrupt the in-flight
+    child even though the parent worker is still blocked.
     """
     import subprocess
     from pathlib import Path
     from .artifacts import SurfaceArtifact
     from .tiler import TileSpec
     from .runner import _build_cmd
+
+    # Check cancel before spawning a subprocess. Otherwise a worker that
+    # gets a fresh task from the executor queue (after the original 4
+    # tasks were SIGTERM'd) would spawn a new ultra_cli that escapes the
+    # registry entirely. The check is also done after communicate()
+    # returns, but the pre-check short-circuits the spawn.
+    if is_cancel_requested(job_id):
+        return
 
     artifact = SurfaceArtifact(**artifact_dict)
     tile = TileSpec(**tile_dict)
@@ -247,7 +406,37 @@ def _run_one_tile(
         Path(out_prefix),
         threads=threads,
     )
-    subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    job_pid_list = pid_registry[job_id]
+    job_pid_list.append(proc.pid)
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=600)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            raise
+        if proc.returncode != 0:
+            # If cancel was requested, the C++ child was SIGTERM'd by the
+            # main process via _terminate_job_subprocesses. The negative
+            # returncode is the signal number, not a real failure. Return
+            # normally so the outer executor loop's is_cancel_requested
+            # check produces the "cancelled" status instead of "failed".
+            if is_cancel_requested(job_id):
+                return
+            raise subprocess.CalledProcessError(
+                proc.returncode, cmd, output=stdout, stderr=stderr,
+            )
+    finally:
+        try:
+            job_pid_list.remove(proc.pid)
+        except ValueError:
+            pass
 
 
 def _run_tiles_with_progress(job_id, artifact, request, tiles):
@@ -328,6 +517,9 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
             message="Ultra job cancelled during tiled native execution.",
         )
 
+    registry = _ensure_pids_registry()
+    job_pid_list = registry.setdefault(job_id, _active_pids_manager.list())
+
     if workers == 1:
         for tile in pending_tiles:
             if is_cancel_requested(job_id):
@@ -346,20 +538,41 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                 out_prefix,
                 threads=threads_per_call,
             )
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            job_pid_list.append(proc.pid)
             try:
-                subprocess.run(
-                    cmd,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=600,
-                )
+                try:
+                    stdout, stderr = proc.communicate(timeout=600)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    stdout, stderr = proc.communicate()
+                    raise
+                if proc.returncode != 0:
+                    if is_cancel_requested(job_id):
+                        return NativeRunResult(
+                            status="cancelled",
+                            model="itm_projected_grid",
+                            message="Ultra job cancelled during tiled native execution.",
+                        )
+                    raise subprocess.CalledProcessError(
+                        proc.returncode, cmd, output=stdout, stderr=stderr,
+                    )
             except Exception as exc:
                 return NativeRunResult(
                     status="failed",
                     model="itm_projected_grid",
                     message=f"tile ({tile.x0},{tile.y0}) failed: {exc}",
                 )
+            finally:
+                try:
+                    job_pid_list.remove(proc.pid)
+                except ValueError:
+                    pass
             _advance_tile_progress_throttled(job_id, total)
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
@@ -374,6 +587,8 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                     tx_y,
                     str(out_prefix),
                     threads_per_call,
+                    job_id,
+                    registry,
                 ): tile
                 for tile in pending_tiles
             }
@@ -652,6 +867,7 @@ def cancel_ultra_job(job_id: str, request: Request) -> dict:
         job["message"] = "Ultra job cancellation requested."
     jobs[job_id] = job
     persist_job(job_id, job)
+    _terminate_job_subprocesses(job_id)
     return public_job(job_id, job, request)
 
 

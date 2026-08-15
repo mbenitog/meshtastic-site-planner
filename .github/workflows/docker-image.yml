@@ -2,7 +2,7 @@ name: Docker Image CI
 
 on:
   push:
-    branches: [ "hires_spain" ]
+    branches: [ "hires_spain", "hires_spain_gpu" ]
 
 permissions:
   contents: read
@@ -51,4 +51,6 @@ jobs:
           context: .
           file: Dockerfile.ultra
           push: true
-          tags: ghcr.io/mbenitog/meshtastic-site-spain-ultra:latest
+          tags: |
+            ghcr.io/mbenitog/meshtastic-site-spain-ultra:latest
+            ghcr.io/mbenitog/meshtastic-site-spain-ultra:${{ github.ref_name }}

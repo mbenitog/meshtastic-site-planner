@@ -1,0 +1,59 @@
+# Docker Compose for GPU-enabled ultra backend.
+#
+# Usage on a server with NVIDIA GPU + nvidia-container-toolkit installed:
+#   docker compose -f docker-compose.gpu.yml up -d
+#
+# For non-NVIDIA GPUs (AMD/Intel), replace the deploy.devices section with
+# the appropriate device mounts and install the vendor ICD on the host.
+#
+# To test WITHOUT a real GPU (CPU-based OpenCL via PoCL, very slow):
+#   Uncomment the pocl line below and remove the devices section.
+
+services:
+  app:
+    image: ghcr.io/mbenitog/meshtastic-site-spain:latest
+    ports:
+      - 8080:80
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  ultra-backend:
+    image: ghcr.io/mbenitog/meshtastic-site-spain-ultra:hires_spain_gpu
+    ports:
+      - 8000:8000
+    volumes:
+      - ultra-cache:/app/.cache
+      # Mount the host's OpenCL ICD vendors so the container can find the GPU driver.
+      # On most Linux installs this is /etc/OpenCL/vendors/*.icd
+      - /etc/OpenCL/vendors:/etc/OpenCL/vendors:ro
+    environment:
+      # Enable the GPU kernel — this makes runner.py auto-select ultra_cli_opencl
+      ULTRA_OPENCL_KERNEL: /usr/local/share/ultra/itm_kernel.cl
+      # Optional: force a specific platform/device (run opencl_probe inside the
+      # container to find the right indices)
+      # ULTRA_OPENCL_PLATFORM: "0"
+      # ULTRA_OPENCL_DEVICE: "0"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - app-network
+
+    # --- CPU-only PoCL fallback (no GPU needed, very slow) ---
+    # To use: comment out the deploy section above, uncomment these lines,
+    # and add `pocl-opencl-icd` to the Dockerfile.ultra runtime stage.
+    # environment:
+    #   ULTRA_OPENCL_KERNEL: /usr/local/share/ultra/itm_kernel.cl
+    # apt install pocl-opencl-icd  # in the Dockerfile
+
+networks:
+  app-network:
+
+volumes:
+  ultra-cache:

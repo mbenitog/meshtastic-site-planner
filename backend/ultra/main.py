@@ -367,6 +367,7 @@ def _run_one_tile(
     threads: int,
     job_id: str,
     pid_registry: dict,
+    opencl_kernel: str = "",
 ) -> None:
     """ProcessPoolExecutor worker: build the per-tile command and run it.
 
@@ -405,6 +406,7 @@ def _run_one_tile(
         tx_y,
         Path(out_prefix),
         threads=threads,
+        opencl_kernel=opencl_kernel,
     )
     proc = subprocess.Popen(
         cmd,
@@ -462,6 +464,11 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     binary = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli")).resolve()
+    opencl_kernel = os.environ.get("ULTRA_OPENCL_KERNEL", "")
+    if opencl_kernel:
+        default_ocl_binary = "engine/build/ultra_cli_opencl"
+        if binary.name == "ultra_cli" and Path(default_ocl_binary).exists():
+            binary = Path(default_ocl_binary).resolve()
     if not binary.exists():
         from .runner import NativeRunResult
         return NativeRunResult(
@@ -537,6 +544,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                 tx_y,
                 out_prefix,
                 threads=threads_per_call,
+                opencl_kernel=opencl_kernel,
             )
             proc = subprocess.Popen(
                 cmd,
@@ -589,6 +597,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                     threads_per_call,
                     job_id,
                     registry,
+                    opencl_kernel,
                 ): tile
                 for tile in pending_tiles
             }

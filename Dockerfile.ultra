@@ -1,26 +1,50 @@
 # Ultra DSM backend image: FastAPI service plus the native projected-grid
 # prototype runner. The static frontend remains in the main Dockerfile.
+#
+# Two compute backends are built:
+#   - ultra_cli        : CPU (multi-threaded, itwom3.0.cpp)
+#   - ultra_cli_opencl : GPU (OpenCL, per-cell ITM, FP64/FP32)
+# The runner picks the GPU binary when ULTRA_OPENCL_KERNEL is set.
 
 FROM debian:bookworm-slim AS native-build
 RUN apt-get update \
   && apt-get install -y --no-install-recommends g++ ca-certificates \
+     ocl-icd-opencl-dev \
   && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY engine/native/ultra_main.cpp engine/native/ultra_main.cpp
+COPY engine/opencl/ultra_cli_opencl.cpp engine/opencl/ultra_cli_opencl.cpp
+COPY engine/opencl/itm_kernel.cl engine/opencl/itm_kernel.cl
 COPY splat/itwom3.0.cpp splat/itwom3.0.cpp
+# CPU binary
 RUN g++ -O2 -std=gnu++11 -pthread -w \
   -o /usr/local/bin/ultra_cli \
   engine/native/ultra_main.cpp splat/itwom3.0.cpp
+# GPU (OpenCL) binary — no splat dependency, kernel is loaded at runtime
+RUN g++ -O2 -std=gnu++11 -w \
+  -o /usr/local/bin/ultra_cli_opencl \
+  engine/opencl/ultra_cli_opencl.cpp -lOpenCL
+# Install the kernel where the runner can find it
+RUN cp engine/opencl/itm_kernel.cl /usr/local/share/ultra/itm_kernel.cl
 
 FROM python:3.12-slim
+# ocl-icd-libopencl1 provides the ICD loader at runtime; the actual
+# vendor ICD (NVIDIA/AMD/Intel/PoCL) must be mounted or installed
+# depending on the host GPU. See docs/gpu-ultra-backend.md.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends curl ca-certificates \
+     ocl-icd-libopencl1 \
   && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY backend/requirements-ultra.txt backend/requirements-ultra.txt
 RUN pip install --no-cache-dir -r backend/requirements-ultra.txt
 COPY backend backend
 COPY --from=native-build /usr/local/bin/ultra_cli /usr/local/bin/ultra_cli
+COPY --from=native-build /usr/local/bin/ultra_cli_opencl /usr/local/bin/ultra_cli_opencl
+COPY --from=native-build /usr/local/share/ultra/itm_kernel.cl /usr/local/share/ultra/itm_kernel.cl
 ENV ULTRA_CLI=/usr/local/bin/ultra_cli
+# To enable GPU: set ULTRA_OPENCL_KERNEL=/usr/local/share/ultra/itm_kernel.cl
+# and ensure an OpenCL ICD is available (e.g. mount /etc/OpenCL/vendors
+# from the host, or install pocl-opencl-icd for CPU fallback).
 EXPOSE 8000
 CMD ["uvicorn", "backend.ultra.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -111,8 +111,21 @@ def run_tiled_native_ultra(
     """Run the native ITM runner tile-by-tile, persist partial results to
     disk, and aggregate the full coverage output. Returns a
     :class:`NativeRunResult` in the same shape as ``run_native_ultra`` so the
-    rest of the pipeline does not have to distinguish between the two paths."""
+    rest of the pipeline does not have to distinguish between the two paths.
+
+    If ``ULTRA_OPENCL_KERNEL`` is set (or ``ULTRA_CLI`` points at the OpenCL
+    binary), the GPU-accelerated ``ultra_cli_opencl`` is used instead of the
+    CPU ``ultra_cli``.  The GPU binary is a drop-in replacement that produces
+    byte-identical output (FP64, bit-exact vs single-threaded CPU).
+    """
     binary = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli"))
+    opencl_kernel = os.environ.get("ULTRA_OPENCL_KERNEL", "")
+    if opencl_kernel:
+        # When the OpenCL kernel path is set, auto-select the OpenCL binary
+        # unless ULTRA_CLI was explicitly set to something else.
+        default_ocl_binary = "engine/build/ultra_cli_opencl"
+        if binary.name == "ultra_cli" and Path(default_ocl_binary).exists():
+            binary = Path(default_ocl_binary)
     if not binary.exists():
         return NativeRunResult(
             status="missing_binary",
@@ -130,7 +143,8 @@ def run_tiled_native_ultra(
         sig_path = tile_signal_path(out_prefix, tile)
         if sig_path.exists():
             continue  # resume support
-        cmd = _build_cmd(binary, artifact, tile, request, tx_x, tx_y, out_prefix)
+        cmd = _build_cmd(binary, artifact, tile, request, tx_x, tx_y, out_prefix,
+                         opencl_kernel=opencl_kernel)
         ok, message = _run_one(cmd, timeout=timeout_per_tile)
         if not ok:
             return NativeRunResult(
@@ -157,6 +171,7 @@ def _build_cmd(
     out_prefix: Path,
     *,
     threads: int | None = None,
+    opencl_kernel: str = "",
 ) -> list[str]:
     cmd = [
         str(binary),
@@ -217,6 +232,8 @@ def _build_cmd(
     ]
     if threads is not None:
         cmd.extend(["--threads", str(threads)])
+    if opencl_kernel:
+        cmd.extend(["--kernel", opencl_kernel])
     return cmd
 
 

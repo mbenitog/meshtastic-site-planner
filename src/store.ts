@@ -3,7 +3,7 @@ import { defineStore } from 'pinia';
 import { randanimalSync } from 'randanimal';
 import maplibregl from 'maplibre-gl';
 import { type Site, type SplatParams } from './types.ts';
-import { cloneObject, defaultUltraBackendUrl } from './utils.ts';
+import { cloneObject, defaultUltraBackendUrl, generateUUID } from './utils.ts';
 import { draftPinElement, sitePinElement, targetPinElement } from './layers.ts';
 import { BASEMAPS, DEFAULT_BASEMAP, applyBasemap, emptyStyle } from './map/styles.ts';
 import { BasemapControl, ExportControl, MeasureControl } from './map/controls.ts';
@@ -980,7 +980,7 @@ const useStore = defineStore('store', {
 
         const cropped = cropToRadius(result, request.lat, request.lon, request.radius);
         const siteParams = cloneObject(this.splatParams);
-        const id = crypto.randomUUID();
+        const id = generateUUID();
         const stats = coverageStats(
           cropped,
           request.lat,

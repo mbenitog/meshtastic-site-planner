@@ -7,6 +7,7 @@ import os
 import signal
 import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Literal
@@ -142,14 +143,26 @@ def job_dir(job_id: str) -> Path:
 def persist_job(job_id: str, job: dict) -> None:
     out = job_dir(job_id)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "job.json").write_text(json.dumps(job, indent=2) + "\n", encoding="utf-8")
+    target = out / "job.json"
+    tmp = out / f"job.json.tmp.{os.getpid()}.{time.time_ns()}"
+    tmp.write_text(json.dumps(job, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(target)
 
 
 def load_job(job_id: str) -> dict | None:
     path = job_dir(job_id) / "job.json"
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    for _ in range(3):
+        try:
+            text = path.read_text(encoding="utf-8")
+            if not text.strip():
+                time.sleep(0.01)
+                continue
+            return json.loads(text)
+        except (json.JSONDecodeError, OSError):
+            time.sleep(0.01)
+    return None
 
 
 def artifact_urls(job_id: str, request: Request) -> dict[str, str]:
@@ -182,8 +195,11 @@ def is_cancel_requested(job_id: str) -> bool:
     truth. The in-memory dict is checked as a fast-path for the main
     process.
     """
-    job = load_job(job_id) or jobs.get(job_id)
-    return bool(job and job.get("cancel_requested"))
+    try:
+        job = load_job(job_id) or jobs.get(job_id)
+        return bool(job and job.get("cancel_requested"))
+    except Exception:
+        return False
 
 
 def mark_cancelled(job_id: str, *, message: str = "Ultra job cancelled.") -> None:
@@ -920,7 +936,26 @@ def get_ultra_artifact(job_id: str, artifact: ArtifactName) -> FileResponse:
     return FileResponse(path, media_type=media_type, filename=filename)
 
 
-app = FastAPI(title="Meshtastic Site Planner Ultra DSM Backend")
+class PollingLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not ("GET " in msg and "/ultra/jobs/" in msg and " 200" in msg)
+
+
+_polling_filter = PollingLogFilter()
+logging.getLogger("uvicorn.access").addFilter(_polling_filter)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.addFilter(_polling_filter)
+    for h in access_logger.handlers:
+        h.addFilter(_polling_filter)
+    yield
+
+
+app = FastAPI(title="Meshtastic Site Planner Ultra DSM Backend", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

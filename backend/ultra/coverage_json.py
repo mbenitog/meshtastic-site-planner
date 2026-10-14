@@ -183,19 +183,26 @@ class CoverageApiClient:
             return parse_coverage_json(cache_path.read_text(encoding="utf-8"))
 
         url = f"{API_COVERAGES_URL}/{collection_id}/coverage?{urlencode(params, safe=',')}"
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        try:
-            with urlopen(req, timeout=timeout) as response:
-                text = response.read().decode("utf-8")
-        except URLError:
-            result = subprocess.run(
-                ["curl", "-L", "-A", "Mozilla/5.0", "--max-time", str(int(timeout)), url],
-                check=True,
-                capture_output=True,
-            )
-            text = result.stdout.decode("utf-8")
-        cache_path.write_text(text, encoding="utf-8")
-        return parse_coverage_json(text)
+        last_error = None
+        for attempt in range(3):
+            try:
+                try:
+                    with urlopen(req, timeout=timeout) as response:
+                        text = response.read().decode("utf-8")
+                except URLError:
+                    result = subprocess.run(
+                        ["curl", "-L", "-A", "Mozilla/5.0", "--max-time", str(int(timeout)), url],
+                        check=True,
+                        capture_output=True,
+                    )
+                    text = result.stdout.decode("utf-8")
+                cache_path.write_text(text, encoding="utf-8")
+                return parse_coverage_json(text)
+            except Exception as exc:
+                last_error = exc
+                import time
+                time.sleep(1.0 * (attempt + 1))
+        raise last_error
 
     def fetch_grid_tiled(
         self,

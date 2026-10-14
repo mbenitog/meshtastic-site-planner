@@ -343,7 +343,9 @@ class SurfaceBuilder:
                 max_x=max_x,
                 max_y=max_y,
             )
-        except Exception:
+        except Exception as exc:
+            import logging
+            logging.getLogger("uvicorn.error").error("❌ [IGN DTM] Failed to fetch DTM 5m grid: %s", exc)
             return None
 
     def _try_fetch_arcgrid(

@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import json
 import struct
+import numpy as np
 
 from .geo import utm30_to_latlon
 from .surface import SurfaceGrid
@@ -52,15 +53,16 @@ def write_surface_artifact(grid: SurfaceGrid, out_dir: str | Path) -> SurfaceArt
     sources_path = out / "surface_sources_u8.bin"
     meta_path = out / "surface_meta.json"
 
-    with surface_path.open("wb") as fp:
-        for value in grid.values.flat:
-            fp.write(struct.pack("<h", max(-32768, min(32767, round(value)))))
-    if grid.sources.size:
-        with sources_path.open("wb") as fp:
-            fp.write(grid.sources.tobytes())
+    values_arr = np.asarray(grid.values, dtype=np.float64).reshape(-1)
+    values_i16 = np.clip(np.round(values_arr), -32768, 32767).astype("<i2")
+    surface_path.write_bytes(values_i16.tobytes())
+
+    sources_arr = np.asarray(grid.sources, dtype=np.uint8).reshape(-1) if hasattr(grid.sources, "__len__") and len(grid.sources) > 0 else np.zeros(0, dtype=np.uint8)
+    if sources_arr.size:
+        sources_path.write_bytes(sources_arr.tobytes())
 
     counts: dict[str, int] = {label: 0 for label in SOURCE_LABELS.values()}
-    for s in grid.sources.flat:
+    for s in sources_arr:
         label = SOURCE_LABELS.get(int(s), "unknown")
         counts[label] = counts.get(label, 0) + 1
 

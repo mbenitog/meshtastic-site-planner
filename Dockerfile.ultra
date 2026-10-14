@@ -22,5 +22,6 @@ RUN pip install --no-cache-dir -r backend/requirements-ultra.txt
 COPY backend backend
 COPY --from=native-build /usr/local/bin/ultra_cli /usr/local/bin/ultra_cli
 ENV ULTRA_CLI=/usr/local/bin/ultra_cli
+ENV PYTHONPATH=/app
 EXPOSE 8000
 CMD ["uvicorn", "backend.ultra.main:app", "--host", "0.0.0.0", "--port", "8000"]

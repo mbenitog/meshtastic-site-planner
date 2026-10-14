@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import multiprocessing
 import os
 import signal
@@ -24,6 +25,8 @@ from .runner import NativeRunnerInput, run_tiled_native_ultra
 from .render import write_coverage_png, write_png_world_file
 from .tiler import plan_tiles
 
+
+logger = logging.getLogger("uvicorn.error")
 
 ULTRA_API_PREFIX = os.environ.get("ULTRA_API_PREFIX", "/ultra-api").rstrip("/") or ""
 ULTRA_PUBLIC_BASE_URL = os.environ.get("ULTRA_PUBLIC_BASE_URL", "").rstrip("/")
@@ -273,12 +276,17 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
     if job.get("cancel_requested"):
         mark_cancelled(job_id, message="Ultra job cancelled before execution started.")
         return
+    logger.info("⚡ [Job %s] Starting Ultra simulation: lat=%.5f, lon=%.5f, radius=%.2f km, mode=%s",
+                job_id, request.lat, request.lon, request.radius_km, request.surface_mode)
+    t_start = time.perf_counter()
     job["status"] = "building_surface"
     job["message"] = "Building measured 2.5 m surface grid."
     set_progress(job, "terrain", 0.1)
     jobs[job_id] = job
     persist_job(job_id, job)
     try:
+        logger.info("⏳ [Job %s] Phase 1/3: Fetching IGN elevation data and composing 2.5m surface grid...", job_id)
+        t_surface = time.perf_counter()
         artifact, runner_input, surface_error = _run_surface_subprocess(
             job_id=job_id,
             request=job["request"],
@@ -290,13 +298,20 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
                     job_id,
                     message="Ultra job cancelled during surface build.",
                 )
+                logger.info("🛑 [Job %s] Cancelled during surface build", job_id)
                 return
             job["status"] = "failed"
             set_progress(job, "finalize", 1.0)
             job["error"] = surface_error or "surface build failed"
             jobs[job_id] = job
             persist_job(job_id, job)
+            logger.error("❌ [Job %s] Surface build failed: %s", job_id, job["error"])
             return
+        
+        surface_dur = time.perf_counter() - t_surface
+        logger.info("✅ [Job %s] Surface ready in %.2fs (%dx%d = %d cells)",
+                    job_id, surface_dur, artifact.width, artifact.height, artifact.width * artifact.height)
+        
         job["surface"] = asdict(artifact)
         job["runner_input"] = asdict(runner_input)
         job["status"] = "running_native"
@@ -308,18 +323,25 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
             "completed": 0,
         }
         persist_job(job_id, job)
+        logger.info("⏳ [Job %s] Phase 2/3: Computing ITM RF coverage across %d tiles (max %d cells/tile)...",
+                    job_id, len(tiles), TILE_MAX_CELLS)
 
+        t_compute = time.perf_counter()
         native_result = _run_tiles_with_progress(
             job_id=job_id,
             artifact=artifact,
             request=job["request"],
             tiles=tiles,
         )
+        compute_dur = time.perf_counter() - t_compute
         if native_result.status == "cancelled":
             mark_cancelled(job_id)
+            logger.info("🛑 [Job %s] Cancelled during compute", job_id)
             return
         job["native_result"] = asdict(native_result)
         if native_result.status == "complete":
+            logger.info("⏳ [Job %s] Phase 3/3: Rendering coverage overlay PNG and metadata...", job_id)
+            t_render = time.perf_counter()
             png_path = write_coverage_png(
                 signal_path=native_result.signal_path or "",
                 mask_path=native_result.mask_path or "",
@@ -334,24 +356,32 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
                 height=artifact.height,
                 bounds_wgs84=artifact.bounds_wgs84,
             )
+            render_dur = time.perf_counter() - t_render
+            total_dur = time.perf_counter() - t_start
+            rate = (artifact.width * artifact.height) / max(0.01, compute_dur)
             job["coverage_png"] = {"path": png_path, "world_path": world_path}
             job["status"] = "coverage_ready"
             set_progress(job, "finalize", 1.0)
             job["message"] = (
                 "Native ultra coverage is ready. Model is ITM/Longley-Rice over the measured projected 2.5 m surface grid."
             )
+            logger.info("🎉 [Job %s] Done! Total: %.2fs (surface: %.2fs, compute: %.2fs @ %.0f cells/s, render: %.2fs)",
+                        job_id, total_dur, surface_dur, compute_dur, rate, render_dur)
         elif native_result.status == "missing_binary":
             job["status"] = "surface_ready"
             set_progress(job, "finalize", 0.75)
             job["message"] = native_result.message
+            logger.warn("⚠️ [Job %s] Missing native runner binary", job_id)
         else:
             job["status"] = "failed"
             set_progress(job, "finalize", 1.0)
             job["error"] = f"native ultra runner failed: {native_result.message}"
+            logger.error("❌ [Job %s] Compute failed: %s", job_id, native_result.message)
     except Exception as exc:
         job["status"] = "failed"
         set_progress(job, "finalize", 1.0)
         job["error"] = f"surface build failed: {exc}"
+        logger.error("❌ [Job %s] Error: %s", job_id, exc)
     jobs[job_id] = job
     persist_job(job_id, job)
 
@@ -651,6 +681,13 @@ def _advance_tile_progress_throttled(
     now = time.monotonic()
     last = tiles_meta.get("last_persist_ts")
     is_last = done >= total
+
+    first_tile_ts = tiles_meta.setdefault("first_tile_ts", now)
+    elapsed = max(0.01, now - first_tile_ts)
+    rate = done / elapsed
+    logger.info("  ↳ [Job %s] Tile %d/%d completed (%.1f%%) [~%.2f tiles/sec, ~%.1fs remaining]",
+                job_id, done, total, (done / total) * 100, rate, (total - done) / max(0.01, rate))
+
     if last is None or (now - last) >= min_interval_s or is_last:
         persist_job(job_id, job)
         tiles_meta["last_persist_ts"] = now

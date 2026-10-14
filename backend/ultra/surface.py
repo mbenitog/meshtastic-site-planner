@@ -49,6 +49,12 @@ class SurfaceGrid:
     1 = dtm + mdsn_e025 (2.5 m building DSM), 2 = dtm + mdsn_v025
     (vegetation), 3 = mds05 absolute 5 m surface."""
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.values, np.ndarray):
+            self.values = np.asarray(self.values, dtype=np.float64)
+        if not isinstance(self.sources, np.ndarray):
+            self.sources = np.asarray(self.sources, dtype=np.uint8)
+
     @property
     def max_x(self) -> float:
         return self.min_x + (self.width - 1) * self.resolution_m

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
-import logging
 import multiprocessing
 import os
 import signal
 import threading
 import time
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+
+logger = logging.getLogger("uvicorn.error")
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -22,12 +24,10 @@ from .geo import meter_bbox_around
 from .ign_dsm import IgnDsmClient
 from .surface import SurfaceBuilder, SurfaceMode
 from .artifacts import SurfaceArtifact
-from .runner import NativeRunnerInput, run_tiled_native_ultra
+from .runner import NativeRunnerInput, NativeRunResult
 from .render import write_coverage_png, write_png_world_file
-from .tiler import plan_tiles
+from .tiler import plan_tiles, aggregate_tiles, make_native_run_result
 
-
-logger = logging.getLogger("uvicorn.error")
 
 ULTRA_API_PREFIX = os.environ.get("ULTRA_API_PREFIX", "/ultra-api").rstrip("/") or ""
 ULTRA_PUBLIC_BASE_URL = os.environ.get("ULTRA_PUBLIC_BASE_URL", "").rstrip("/")
@@ -60,6 +60,63 @@ jobs: dict[str, dict] = {}
 JOB_ROOT = Path(".cache/ultra-jobs")
 TILE_MAX_CELLS = 250_000
 SINGLE_TILE_CELL_THRESHOLD = 1_000_000
+_cached_gpu_tile_cells: int | None = None
+
+
+def _resolve_native_binary() -> tuple[Path, str]:
+    binary = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli")).resolve()
+    opencl_kernel = os.environ.get("ULTRA_OPENCL_KERNEL", "")
+    if not opencl_kernel:
+        for cand in [Path("/usr/local/share/ultra/itm_kernel.cl"), Path("engine/opencl/itm_kernel.cl")]:
+            if cand.exists():
+                opencl_kernel = str(cand.resolve())
+                break
+    if opencl_kernel:
+        candidates = [
+            binary.with_name("ultra_cli_opencl"),
+            Path("/usr/local/bin/ultra_cli_opencl"),
+            Path("engine/build/ultra_cli_opencl"),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                binary = candidate.resolve()
+                break
+    return binary, opencl_kernel
+
+
+def get_optimal_tile_cells(binary_path: Path, opencl_kernel: str) -> int:
+    global _cached_gpu_tile_cells
+    env_override = os.environ.get("ULTRA_TILE_MAX_CELLS")
+    if env_override:
+        return max(50_000, int(env_override))
+    if not opencl_kernel or binary_path.name != "ultra_cli_opencl":
+        return TILE_MAX_CELLS
+    if _cached_gpu_tile_cells is not None:
+        return _cached_gpu_tile_cells
+
+    try:
+        import subprocess
+        proc = subprocess.run([str(binary_path), "--probe"], capture_output=True, text=True, timeout=5)
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout)
+            vram_mb = data.get("vram_mb", 0)
+            if vram_mb >= 12000:
+                _cached_gpu_tile_cells = 4_000_000
+            elif vram_mb >= 6000:
+                _cached_gpu_tile_cells = 2_000_000
+            elif vram_mb >= 3000:
+                _cached_gpu_tile_cells = 1_000_000
+            elif vram_mb >= 1500:
+                _cached_gpu_tile_cells = 500_000
+            else:
+                _cached_gpu_tile_cells = 250_000
+            logger.info("🎮 [GPU Auto-scale] Detected %s (%d MB VRAM) -> optimal tile size: %d cells",
+                        data.get("device", "GPU"), vram_mb, _cached_gpu_tile_cells)
+            return _cached_gpu_tile_cells
+    except Exception as exc:
+        logger.warning("Could not probe OpenCL device: %s", exc)
+    _cached_gpu_tile_cells = 250_000
+    return _cached_gpu_tile_cells
 
 # Cross-process registry of in-flight C++ subprocesses (ultra_cli) keyed by
 # job_id. Backed by a multiprocessing.Manager so that worker processes
@@ -292,22 +349,23 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
     if job.get("cancel_requested"):
         mark_cancelled(job_id, message="Ultra job cancelled before execution started.")
         return
-    logger.info("⚡ [Job %s] Starting Ultra simulation: lat=%.5f, lon=%.5f, radius=%.2f km, mode=%s",
-                job_id, request.lat, request.lon, request.radius_km, request.surface_mode)
-    t_start = time.perf_counter()
     job["status"] = "building_surface"
     job["message"] = "Building measured 2.5 m surface grid."
     set_progress(job, "terrain", 0.1)
     jobs[job_id] = job
     persist_job(job_id, job)
+    logger.info("🚀 [Job %s] Starting Ultra simulation: lat=%.5f, lon=%.5f, radius=%.1fkm, res=%.1fm",
+                job_id, request.lat, request.lon, request.radius_km, request.resolution_m)
+    t_start = time.perf_counter()
     try:
-        logger.info("⏳ [Job %s] Phase 1/3: Fetching IGN elevation data and composing 2.5m surface grid...", job_id)
         t_surface = time.perf_counter()
+        logger.info("⏳ [Job %s] Phase 1/3: Fetching IGN surface data (DSM/DTM)...", job_id)
         artifact, runner_input, surface_error = _run_surface_subprocess(
             job_id=job_id,
             request=job["request"],
             out_dir=job_dir(job_id),
         )
+        surface_dur = time.perf_counter() - t_surface
         if artifact is None:
             if surface_error and surface_error.startswith("cancelled"):
                 mark_cancelled(
@@ -323,24 +381,24 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
             persist_job(job_id, job)
             logger.error("❌ [Job %s] Surface build failed: %s", job_id, job["error"])
             return
-        
-        surface_dur = time.perf_counter() - t_surface
-        logger.info("✅ [Job %s] Surface ready in %.2fs (%dx%d = %d cells)",
-                    job_id, surface_dur, artifact.width, artifact.height, artifact.width * artifact.height)
-        
+        logger.info("✅ [Job %s] Surface grid ready in %.2fs: %dx%d cells (%s MB)",
+                    job_id, surface_dur, artifact.width, artifact.height,
+                    round((artifact.width * artifact.height * 2) / (1024 * 1024), 2))
         job["surface"] = asdict(artifact)
         job["runner_input"] = asdict(runner_input)
         job["status"] = "running_native"
         job["message"] = "Running ITM/Longley-Rice over measured projected-grid terrain in tiles."
         set_progress(job, "compute", 0.4)
-        tiles = plan_tiles(artifact.width, artifact.height, TILE_MAX_CELLS)
+        binary, opencl_kernel = _resolve_native_binary()
+        tile_max_cells = get_optimal_tile_cells(binary, opencl_kernel)
+        tiles = plan_tiles(artifact.width, artifact.height, tile_max_cells)
         job["tiles"] = {
             "count": len(tiles),
             "completed": 0,
         }
         persist_job(job_id, job)
         logger.info("⏳ [Job %s] Phase 2/3: Computing ITM RF coverage across %d tiles (max %d cells/tile)...",
-                    job_id, len(tiles), TILE_MAX_CELLS)
+                    job_id, len(tiles), tile_max_cells)
 
         t_compute = time.perf_counter()
         native_result = _run_tiles_with_progress(
@@ -413,6 +471,7 @@ def _run_one_tile(
     threads: int,
     job_id: str,
     pid_registry: dict,
+    opencl_kernel: str = "",
 ) -> None:
     """ProcessPoolExecutor worker: build the per-tile command and run it.
 
@@ -451,6 +510,7 @@ def _run_one_tile(
         tx_y,
         Path(out_prefix),
         threads=threads,
+        opencl_kernel=opencl_kernel,
     )
     proc = subprocess.Popen(
         cmd,
@@ -507,7 +567,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
     from pathlib import Path
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    binary = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli")).resolve()
+    binary, opencl_kernel = _resolve_native_binary()
     if not binary.exists():
         from .runner import NativeRunResult
         return NativeRunResult(
@@ -515,6 +575,9 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
             model="itm_projected_grid",
             message=f"native ultra runner not found at {binary}; run engine/build_native.sh",
         )
+
+    logger.info("⚡ [Job %s] Runner selected: %s (OpenCL Kernel: %s)",
+                job_id, binary.name, opencl_kernel or "none")
 
     out_dir = job_dir(job_id).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -535,9 +598,10 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
         else:
             pending_tiles.append(tile)
 
+    is_gpu = (binary.name == "ultra_cli_opencl" and bool(opencl_kernel))
     if total_cells <= SINGLE_TILE_CELL_THRESHOLD or len(pending_tiles) <= 1:
         workers = 1
-        threads_per_call = cpu_count
+        threads_per_call = 1 if is_gpu else cpu_count
     else:
         env_workers = os.environ.get("ULTRA_TILE_WORKERS")
         if env_workers is not None:
@@ -546,8 +610,9 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                 max(1, len(pending_tiles)),
             )
         else:
-            workers = min(cpu_count, len(pending_tiles))
-        threads_per_call = max(1, cpu_count // workers)
+            default_workers = 1 if is_gpu else cpu_count
+            workers = min(default_workers, len(pending_tiles))
+        threads_per_call = 1 if is_gpu else max(1, cpu_count // workers)
 
     job = jobs.get(job_id)
     if job is not None:
@@ -583,6 +648,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                 tx_y,
                 out_prefix,
                 threads=threads_per_call,
+                opencl_kernel=opencl_kernel,
             )
             proc = subprocess.Popen(
                 cmd,
@@ -635,6 +701,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                     threads_per_call,
                     job_id,
                     registry,
+                    opencl_kernel,
                 ): tile
                 for tile in pending_tiles
             }
@@ -657,12 +724,11 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                         message="Ultra job cancelled during tiled native execution.",
                     )
 
-    return run_tiled_native_ultra(
-        artifact=artifact,
-        request=request,
-        out_dir=out_dir,
-        max_tile_cells=TILE_MAX_CELLS,
-    )
+    meta = aggregate_tiles(artifact=artifact, tiles=tiles, out_dir=out_dir)
+    meta["rx_sensitivity_dbm"] = request["rx_sensitivity_dbm"]
+    (out_dir / "coverage.meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    payload = make_native_run_result(out_prefix)
+    return NativeRunResult(**payload)
 
 
 def _advance_tile_progress(job_id: str, total: int) -> None:

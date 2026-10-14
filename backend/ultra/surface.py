@@ -77,12 +77,12 @@ def _coverage_lookup_filled(
 ) -> np.ndarray:
     """Nearest-cell lookup of a CoverageGrid over a regular target grid.
 
-    Returns a 2D float array of shape ``(len(ys), len(xs))``. Missing source
+    Returns a 2D float32 array of shape ``(len(ys), len(xs))``. Missing source
     cells are filled in by :class:`CoverageGrid`'s precomputed ``_filled``
     array so this lookup always returns a finite value.
     """
     if grid.width <= 0 or grid.height <= 0:
-        return np.full((ys.shape[0], xs.shape[0]), np.nan, dtype=np.float64)
+        return np.full((ys.shape[0], xs.shape[0]), np.nan, dtype=np.float32)
     cols = np.clip(
         np.round((xs[None, :] - grid.min_x) / grid.dx).astype(np.int64),
         0,
@@ -100,7 +100,7 @@ def _coverage_lookup_filled(
             0,
             grid.height - 1,
         )
-    return grid._filled[rows, cols]
+    return grid._filled[rows, cols].astype(np.float32, copy=False)
 
 
 def _arcgrid_lookup_filled(
@@ -108,13 +108,13 @@ def _arcgrid_lookup_filled(
 ) -> np.ndarray:
     """Nearest-cell lookup of an ArcGrid over a regular target grid.
 
-    Returns a 2D float array of shape ``(len(ys), len(xs))`` with NaN where
+    Returns a 2D float32 array of shape ``(len(ys), len(xs))`` with NaN where
     the source has no data (missing tile or nodata sentinel). ``grid=None``
     also yields all-NaN.
     """
     if grid is None or grid.ncols <= 0 or grid.nrows <= 0:
-        return np.full((ys.shape[0], xs.shape[0]), np.nan, dtype=np.float64)
-    src = np.array(grid.values, dtype=np.float64).reshape(grid.nrows, grid.ncols)
+        return np.full((ys.shape[0], xs.shape[0]), np.nan, dtype=np.float32)
+    src = np.asarray(grid.values, dtype=np.float32).reshape(grid.nrows, grid.ncols)
     if grid.nodata is not None:
         src = np.where(src == grid.nodata, np.nan, src)
     cols = np.clip(
@@ -264,21 +264,33 @@ class SurfaceBuilder:
         ys = max_y - np.arange(height, dtype=np.float64) * resolution_m
 
         terrain_arr = _coverage_lookup_filled(terrain, xs, ys)
+        del terrain
+
         building_raw = _arcgrid_lookup_filled(buildings, xs, ys)
+        del buildings
+
         vegetation_raw = _arcgrid_lookup_filled(vegetation, xs, ys)
+        del vegetation
+
         surface_5m_raw = _arcgrid_lookup_filled(surface_5m, xs, ys)
+        del surface_5m
 
         building_m = np.where(
-            np.isnan(building_raw), 0.0, np.maximum(0.0, building_raw)
+            np.isnan(building_raw), np.float32(0.0), np.maximum(np.float32(0.0), building_raw)
         )
+        del building_raw
+
         vegetation_m = np.where(
-            np.isnan(vegetation_raw), 0.0, np.maximum(0.0, vegetation_raw)
+            np.isnan(vegetation_raw), np.float32(0.0), np.maximum(np.float32(0.0), vegetation_raw)
         )
+        del vegetation_raw
+
         surface_5m_m = np.where(
             np.isnan(surface_5m_raw),
-            np.nan,
+            np.float32(np.nan),
             np.maximum(terrain_arr, surface_5m_raw),
         )
+        del surface_5m_raw
 
         if mode == "dtm_only":
             values_arr = terrain_arr
@@ -290,36 +302,30 @@ class SurfaceBuilder:
             values_arr = terrain_arr.copy()
             sources_arr = np.zeros(terrain_arr.shape, dtype=np.uint8)
 
-            # building_m > 0 -> value = terrain + max(building, vegetation);
-            # source = 2 if vegetation >= building else 1.
             building_obstruction = np.maximum(building_m, vegetation_m)
             building_source = np.where(
                 vegetation_m >= building_m,
                 np.uint8(2),
                 np.uint8(1),
             ).astype(np.uint8)
-            values_arr = np.where(
-                has_building,
-                terrain_arr + building_obstruction,
-                values_arr,
-            )
-            sources_arr = np.where(has_building, building_source, sources_arr)
 
-            # vegetation_m > 0 (and no building) -> value = terrain + vegetation;
-            # source = 2.
-            values_arr = np.where(
-                has_vegetation,
-                terrain_arr + vegetation_m,
-                values_arr,
-            )
-            sources_arr = np.where(has_vegetation, np.uint8(2), sources_arr)
+            values_arr[has_building] = terrain_arr[has_building] + building_obstruction[has_building]
+            sources_arr[has_building] = building_source[has_building]
+            del building_m, building_obstruction, building_source
+
+            values_arr[has_vegetation] = terrain_arr[has_vegetation] + vegetation_m[has_vegetation]
+            sources_arr[has_vegetation] = np.uint8(2)
+            del vegetation_m
 
             # LOD fallback only for lod_dtm_plus_buildings: value = surface_5m_m,
             # source = 3, bypasses the terrain + obstruction addition.
             if mode == "lod_dtm_plus_buildings":
                 has_lod = ~has_building & ~has_vegetation & ~np.isnan(surface_5m_m)
-                values_arr = np.where(has_lod, surface_5m_m, values_arr)
-                sources_arr = np.where(has_lod, np.uint8(3), sources_arr)
+                values_arr[has_lod] = surface_5m_m[has_lod]
+                sources_arr[has_lod] = np.uint8(3)
+                del surface_5m_m, has_lod
+
+            del has_building, has_vegetation
 
         return SurfaceGrid(
             width=width,

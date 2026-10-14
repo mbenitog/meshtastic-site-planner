@@ -106,13 +106,38 @@ def run_tiled_native_ultra(
     out_dir: str | Path,
     *,
     max_tile_cells: int = 250_000,
+    tiles: list[TileSpec] | None = None,
     timeout_per_tile: float = 180.0,
 ) -> NativeRunResult:
     """Run the native ITM runner tile-by-tile, persist partial results to
     disk, and aggregate the full coverage output. Returns a
     :class:`NativeRunResult` in the same shape as ``run_native_ultra`` so the
-    rest of the pipeline does not have to distinguish between the two paths."""
+    rest of the pipeline does not have to distinguish between the two paths.
+
+    If ``ULTRA_OPENCL_KERNEL`` is set (or ``ULTRA_CLI`` points at the OpenCL
+    binary), the GPU-accelerated ``ultra_cli_opencl`` is used instead of the
+    CPU ``ultra_cli``.  The GPU binary is a drop-in replacement that produces
+    byte-identical output (FP64, bit-exact vs single-threaded CPU).
+    """
     binary = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli"))
+    opencl_kernel = os.environ.get("ULTRA_OPENCL_KERNEL", "")
+    if not opencl_kernel:
+        for cand in [Path("/usr/local/share/ultra/itm_kernel.cl"), Path("engine/opencl/itm_kernel.cl")]:
+            if cand.exists():
+                opencl_kernel = str(cand.resolve())
+                break
+    if opencl_kernel:
+        # When the OpenCL kernel path is set, auto-select the OpenCL binary
+        # unless ULTRA_CLI was explicitly pointed at something custom.
+        candidates = [
+            binary.with_name("ultra_cli_opencl"),
+            Path("/usr/local/bin/ultra_cli_opencl"),
+            Path("engine/build/ultra_cli_opencl"),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                binary = candidate
+                break
     if not binary.exists():
         return NativeRunResult(
             status="missing_binary",
@@ -123,14 +148,16 @@ def run_tiled_native_ultra(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     out_prefix = out / "coverage"
-    tiles = plan_tiles(artifact.width, artifact.height, max_tile_cells=max_tile_cells)
+    if tiles is None:
+        tiles = plan_tiles(artifact.width, artifact.height, max_tile_cells=max_tile_cells)
     tx_x, tx_y = latlon_to_utm30(request["lat"], request["lon"])
 
     for tile in tiles:
         sig_path = tile_signal_path(out_prefix, tile)
         if sig_path.exists():
             continue  # resume support
-        cmd = _build_cmd(binary, artifact, tile, request, tx_x, tx_y, out_prefix)
+        cmd = _build_cmd(binary, artifact, tile, request, tx_x, tx_y, out_prefix,
+                         opencl_kernel=opencl_kernel)
         ok, message = _run_one(cmd, timeout=timeout_per_tile)
         if not ok:
             return NativeRunResult(
@@ -157,6 +184,7 @@ def _build_cmd(
     out_prefix: Path,
     *,
     threads: int | None = None,
+    opencl_kernel: str = "",
 ) -> list[str]:
     cmd = [
         str(binary),
@@ -217,6 +245,8 @@ def _build_cmd(
     ]
     if threads is not None:
         cmd.extend(["--threads", str(threads)])
+    if opencl_kernel:
+        cmd.extend(["--kernel", opencl_kernel])
     return cmd
 
 

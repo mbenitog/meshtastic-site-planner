@@ -53,7 +53,7 @@ def write_surface_artifact(grid: SurfaceGrid, out_dir: str | Path) -> SurfaceArt
     sources_path = out / "surface_sources_u8.bin"
     meta_path = out / "surface_meta.json"
 
-    values_arr = np.asarray(grid.values, dtype=np.float64).reshape(-1)
+    values_arr = np.asarray(grid.values, dtype=np.float32).reshape(-1)
     values_i16 = np.clip(np.round(values_arr), -32768, 32767).astype("<i2")
     surface_path.write_bytes(values_i16.tobytes())
 
@@ -62,9 +62,11 @@ def write_surface_artifact(grid: SurfaceGrid, out_dir: str | Path) -> SurfaceArt
         sources_path.write_bytes(sources_arr.tobytes())
 
     counts: dict[str, int] = {label: 0 for label in SOURCE_LABELS.values()}
-    for s in sources_arr:
-        label = SOURCE_LABELS.get(int(s), "unknown")
-        counts[label] = counts.get(label, 0) + 1
+    if sources_arr.size > 0:
+        unique_vals, unique_counts = np.unique(sources_arr, return_counts=True)
+        for code, cnt in zip(unique_vals, unique_counts):
+            label = SOURCE_LABELS.get(int(code), "unknown")
+            counts[label] = int(cnt)
 
     half = grid.resolution_m / 2.0
     # Grid coordinates are sample centers; overlay/image corners need the

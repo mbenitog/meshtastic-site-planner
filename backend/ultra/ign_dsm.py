@@ -13,6 +13,9 @@ import subprocess
 from urllib.error import URLError
 
 
+import numpy as np
+
+
 logger = logging.getLogger("uvicorn.error")
 
 WCS_URL = "https://wcs-mds.idee.es/mds"
@@ -26,15 +29,19 @@ class ArcGrid:
     xllcorner: float
     yllcorner: float
     cellsize: float
-    values: list[float]
+    values: np.ndarray | list[float]
     nodata: float | None = None
 
     @property
     def min_value(self) -> float:
+        if isinstance(self.values, np.ndarray):
+            return float(self.values.min()) if self.values.size else 0.0
         return min(self.values) if self.values else 0.0
 
     @property
     def max_value(self) -> float:
+        if isinstance(self.values, np.ndarray):
+            return float(self.values.max()) if self.values.size else 0.0
         return max(self.values) if self.values else 0.0
 
 
@@ -78,23 +85,18 @@ def parse_arcgrid(text: str) -> ArcGrid:
     ncols = int(header["ncols"])
     nrows = int(header["nrows"])
     nodata_value = header.get("nodata_value")
-    values: list[float] = []
-    nodata = nodata_value
-    for line in lines[data_start:]:
-        for raw in line.split():
-            value = float(raw)
-            if nodata is None or value != nodata:
-                values.append(value)
-    if len(values) != ncols * nrows:
-        raise ValueError(f"ArcGrid size mismatch: expected {ncols * nrows}, got {len(values)}")
+    data_str = " ".join(lines[data_start:])
+    arr = np.fromstring(data_str, sep=" ", dtype=np.float32)
+    if arr.size != ncols * nrows:
+        raise ValueError(f"ArcGrid size mismatch: expected {ncols * nrows}, got {arr.size}")
     return ArcGrid(
         ncols=ncols,
         nrows=nrows,
         xllcorner=header["xllcorner"],
         yllcorner=header["yllcorner"],
         cellsize=header["cellsize"],
-        values=values,
-        nodata=nodata,
+        values=arr,
+        nodata=nodata_value,
     )
 
 
@@ -260,51 +262,56 @@ def stitch_arcgrids(
     cell_size: float,
 ) -> ArcGrid:
     """Stitch per-tile ArcGrids into a single grid covering [min_x,max_x) x
-    [min_y,max_y) at the requested cell size. Tiles are assumed to be
-    contiguous (or overlapping at most at the cell boundary) and aligned
-    to the same cell size."""
+    [min_y,max_y) at the requested cell size. Optimized with numpy 2D block
+    slicing to avoid Python loop overhead and minimize RAM usage."""
     ncols = max(1, int(round((max_x - min_x) / cell_size)))
     nrows = max(1, int(round((max_y - min_y) / cell_size)))
-    values: list[float | None] = [None] * (ncols * nrows)
-    nodata_value: float | None = None
+    grid = np.full((nrows, ncols), np.nan, dtype=np.float32)
+    nodata_value: float = -9999.0
+
     for tile in tiles:
         t_ncols = tile.ncols
         t_nrows = tile.nrows
-        t_x0 = tile.xllcorner
-        t_y0 = tile.yllcorner
         if t_ncols <= 0 or t_nrows <= 0:
             continue
-        t_x1 = t_x0 + (t_ncols - 1) * tile.cellsize
+        t_x0 = tile.xllcorner
+        t_y0 = tile.yllcorner
         t_y1 = t_y0 + (t_nrows - 1) * tile.cellsize
-        col0 = max(0, int(round((t_x0 - min_x) / cell_size)))
-        row0 = max(0, int(round((max_y - t_y1) / cell_size)))
-        for r in range(t_nrows):
-            src_y = t_y0 + (t_nrows - 1 - r) * tile.cellsize
-            dst_row = max(0, int(round((max_y - src_y) / cell_size)))
-            if dst_row < 0 or dst_row >= nrows:
-                continue
-            for c in range(t_ncols):
-                src_x = t_x0 + c * tile.cellsize
-                dst_col = int(round((src_x - min_x) / cell_size))
-                if dst_col < 0 or dst_col >= ncols:
-                    continue
-                value = tile.values[r * t_ncols + c]
-                values[dst_row * ncols + dst_col] = value
-                if tile.nodata is not None and value == tile.nodata:
-                    nodata_value = tile.nodata
-    cleaned: list[float] = []
-    for v in values:
-        if v is None:
-            cleaned.append(-9999.0)
-            nodata_value = -9999.0
+
+        col0 = int(round((t_x0 - min_x) / cell_size))
+        row0 = int(round((max_y - t_y1) / cell_size))
+
+        dst_c0 = max(0, col0)
+        dst_c1 = min(ncols, col0 + t_ncols)
+        dst_r0 = max(0, row0)
+        dst_r1 = min(nrows, row0 + t_nrows)
+
+        if dst_c1 <= dst_c0 or dst_r1 <= dst_r0:
+            continue
+
+        src_c0 = dst_c0 - col0
+        src_c1 = src_c0 + (dst_c1 - dst_c0)
+        src_r0 = dst_r0 - row0
+        src_r1 = src_r0 + (dst_r1 - dst_r0)
+
+        tile_data = np.asarray(tile.values, dtype=np.float32).reshape(t_nrows, t_ncols)
+        tile_chunk = tile_data[src_r0:src_r1, src_c0:src_c1]
+
+        target_slice = grid[dst_r0:dst_r1, dst_c0:dst_c1]
+        if tile.nodata is not None:
+            valid_mask = tile_chunk != tile.nodata
+            target_slice[valid_mask] = tile_chunk[valid_mask]
         else:
-            cleaned.append(v)
+            target_slice[:] = tile_chunk
+
+    np.nan_to_num(grid, copy=False, nan=nodata_value)
+
     return ArcGrid(
         ncols=ncols,
         nrows=nrows,
         xllcorner=min_x,
         yllcorner=min_y,
         cellsize=cell_size,
-        values=cleaned,
+        values=grid.ravel(),
         nodata=nodata_value,
     )

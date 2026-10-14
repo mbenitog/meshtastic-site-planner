@@ -106,6 +106,7 @@ def run_tiled_native_ultra(
     out_dir: str | Path,
     *,
     max_tile_cells: int = 250_000,
+    tiles: list[TileSpec] | None = None,
     timeout_per_tile: float = 180.0,
 ) -> NativeRunResult:
     """Run the native ITM runner tile-by-tile, persist partial results to
@@ -147,7 +148,8 @@ def run_tiled_native_ultra(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     out_prefix = out / "coverage"
-    tiles = plan_tiles(artifact.width, artifact.height, max_tile_cells=max_tile_cells)
+    if tiles is None:
+        tiles = plan_tiles(artifact.width, artifact.height, max_tile_cells=max_tile_cells)
     tx_x, tx_y = latlon_to_utm30(request["lat"], request["lon"])
 
     for tile in tiles:

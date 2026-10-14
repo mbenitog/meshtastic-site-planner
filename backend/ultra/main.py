@@ -24,9 +24,9 @@ from .geo import meter_bbox_around
 from .ign_dsm import IgnDsmClient
 from .surface import SurfaceBuilder, SurfaceMode
 from .artifacts import SurfaceArtifact
-from .runner import NativeRunnerInput, run_tiled_native_ultra
+from .runner import NativeRunnerInput, NativeRunResult
 from .render import write_coverage_png, write_png_world_file
-from .tiler import plan_tiles
+from .tiler import plan_tiles, aggregate_tiles, make_native_run_result
 
 
 ULTRA_API_PREFIX = os.environ.get("ULTRA_API_PREFIX", "/ultra-api").rstrip("/") or ""
@@ -724,12 +724,11 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                         message="Ultra job cancelled during tiled native execution.",
                     )
 
-    return run_tiled_native_ultra(
-        artifact=artifact,
-        request=request,
-        out_dir=out_dir,
-        max_tile_cells=TILE_MAX_CELLS,
-    )
+    meta = aggregate_tiles(artifact=artifact, tiles=tiles, out_dir=out_dir)
+    meta["rx_sensitivity_dbm"] = request["rx_sensitivity_dbm"]
+    (out_dir / "coverage.meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    payload = make_native_run_result(out_prefix)
+    return NativeRunResult(**payload)
 
 
 def _advance_tile_progress(job_id: str, total: int) -> None:

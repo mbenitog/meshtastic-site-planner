@@ -31,30 +31,16 @@ class CoverageGrid:
     max_x: float
     min_y: float
     max_y: float
-    values: list[float | None]
+    values: list[float | None] | np.ndarray
 
     def __post_init__(self) -> None:
-        # Precompute numpy views used by the hot path so the per-cell
-        # inner loop in SurfaceBuilder.build can do a single O(1) lookup
-        # instead of a per-call O(width*height) scan when the cell is None.
-        #
-        # _values_arr: original values with None replaced by NaN. Used by
-        # min/max_value and preserved exactly: a cell that was None stays
-        # NaN so we can distinguish "no data" from "real 0 m".
-        # _valid: boolean mask of cells that had a real value originally.
-        # _filled: _values_arr with every None cell filled from the nearest
-        # non-null neighbour. This is what sample_nearest returns.
-        #
-        # The fill is a 2-pass scan (top->bottom then left->right,
-        # bottom->top then right->left) instead of an exact Euclidean
-        # nearest-neighbour fill (which would require scipy.ndimage
-        # .distance_transform_edt). The 2-pass is O(N) total, propagates
-        # from any direction, and is good enough for terrain
-        # interpolation since missing data only appears at IGN bbox edges.
-        arr = np.array(
-            [np.nan if v is None else float(v) for v in self.values],
-            dtype=np.float64,
-        ).reshape(self.height, self.width)
+        if isinstance(self.values, np.ndarray):
+            arr = np.asarray(self.values, dtype=np.float32).reshape(self.height, self.width)
+        else:
+            arr = np.array(
+                [np.nan if v is None else float(v) for v in self.values],
+                dtype=np.float32,
+            ).reshape(self.height, self.width)
         valid = ~np.isnan(arr)
         filled = arr.copy()
         if not bool(valid.all()):
@@ -282,7 +268,8 @@ def stitch_coverage_grids(
     [min_x,max_x) x [min_y,max_y) at the requested cell size."""
     ncols = max(1, int(round((max_x - min_x) / cell_size)))
     nrows = max(1, int(round((max_y - min_y) / cell_size)))
-    values: list[float | None] = [None] * (ncols * nrows)
+    grid = np.zeros((nrows, ncols), dtype=np.float32)
+
     for tile in tiles:
         if tile.width <= 0 or tile.height <= 0:
             continue
@@ -290,20 +277,26 @@ def stitch_coverage_grids(
         tile_dy = tile.dy
         if tile_dx == 0 or tile_dy == 0:
             continue
-        for r in range(tile.height):
-            src_y = tile.max_y - (r + 0.5) * tile_dy
-            dst_row = int(round((max_y - src_y) / cell_size - 0.5))
-            if dst_row < 0 or dst_row >= nrows:
-                continue
-            for c in range(tile.width):
-                src_x = tile.min_x + (c + 0.5) * tile_dx
-                dst_col = int(round((src_x - min_x) / cell_size - 0.5))
-                if dst_col < 0 or dst_col >= ncols:
-                    continue
-                values[dst_row * ncols + dst_col] = tile.values[r * tile.width + c]
-    cleaned: list[float] = []
-    for v in values:
-        cleaned.append(0.0 if v is None else v)
+
+        col0 = int(round((tile.min_x - min_x) / cell_size))
+        row0 = int(round((max_y - tile.max_y) / cell_size))
+
+        dst_c0 = max(0, col0)
+        dst_c1 = min(ncols, col0 + tile.width)
+        dst_r0 = max(0, row0)
+        dst_r1 = min(nrows, row0 + tile.height)
+
+        if dst_c1 <= dst_c0 or dst_r1 <= dst_r0:
+            continue
+
+        src_c0 = dst_c0 - col0
+        src_c1 = src_c0 + (dst_c1 - dst_c0)
+        src_r0 = dst_r0 - row0
+        src_r1 = src_r0 + (dst_r1 - dst_r0)
+
+        tile_data = np.asarray(tile._filled, dtype=np.float32)
+        grid[dst_r0:dst_r1, dst_c0:dst_c1] = tile_data[src_r0:src_r1, src_c0:src_c1]
+
     return CoverageGrid(
         width=ncols,
         height=nrows,
@@ -311,5 +304,5 @@ def stitch_coverage_grids(
         max_x=max_x,
         min_y=min_y,
         max_y=max_y,
-        values=cleaned,
+        values=grid.ravel(),
     )

@@ -84,39 +84,79 @@ def _resolve_native_binary() -> tuple[Path, str]:
     return binary, opencl_kernel
 
 
+_cached_gpu_info: dict | None = None
+
+
+def _probe_gpu(binary_path: Path) -> dict | None:
+    global _cached_gpu_info
+    if _cached_gpu_info is not None:
+        return _cached_gpu_info
+    try:
+        import subprocess
+        proc = subprocess.run([str(binary_path), "--probe"], capture_output=True, text=True, timeout=5)
+        if proc.returncode == 0:
+            _cached_gpu_info = json.loads(proc.stdout)
+            return _cached_gpu_info
+    except Exception as exc:
+        logger.warning("Could not probe OpenCL device: %s", exc)
+    return None
+
+
 def get_optimal_tile_cells(binary_path: Path, opencl_kernel: str) -> int:
-    global _cached_gpu_tile_cells
     env_override = os.environ.get("ULTRA_TILE_MAX_CELLS")
     if env_override:
         return max(50_000, int(env_override))
     if not opencl_kernel or binary_path.name != "ultra_cli_opencl":
         return TILE_MAX_CELLS
-    if _cached_gpu_tile_cells is not None:
-        return _cached_gpu_tile_cells
+    info = _probe_gpu(binary_path)
+    if not info:
+        return TILE_MAX_CELLS
+    vram_mb = info.get("vram_mb", 0)
+    if vram_mb >= 12000:
+        tile_cells = 4_000_000
+    elif vram_mb >= 6000:
+        tile_cells = 2_000_000
+    elif vram_mb >= 3000:
+        tile_cells = 1_000_000
+    elif vram_mb >= 1500:
+        tile_cells = 500_000
+    else:
+        tile_cells = 250_000
+    logger.info("🎮 [GPU Auto-scale] Device: %s (%d MB VRAM) -> optimal tile size: %d cells",
+                info.get("device", "GPU"), vram_mb, tile_cells)
+    return tile_cells
 
-    try:
-        import subprocess
-        proc = subprocess.run([str(binary_path), "--probe"], capture_output=True, text=True, timeout=5)
-        if proc.returncode == 0:
-            data = json.loads(proc.stdout)
-            vram_mb = data.get("vram_mb", 0)
-            if vram_mb >= 12000:
-                _cached_gpu_tile_cells = 4_000_000
-            elif vram_mb >= 6000:
-                _cached_gpu_tile_cells = 2_000_000
-            elif vram_mb >= 3000:
-                _cached_gpu_tile_cells = 1_000_000
-            elif vram_mb >= 1500:
-                _cached_gpu_tile_cells = 500_000
-            else:
-                _cached_gpu_tile_cells = 250_000
-            logger.info("🎮 [GPU Auto-scale] Detected %s (%d MB VRAM) -> optimal tile size: %d cells",
-                        data.get("device", "GPU"), vram_mb, _cached_gpu_tile_cells)
-            return _cached_gpu_tile_cells
-    except Exception as exc:
-        logger.warning("Could not probe OpenCL device: %s", exc)
-    _cached_gpu_tile_cells = 250_000
-    return _cached_gpu_tile_cells
+
+def get_optimal_gpu_workers(
+    binary_path: Path,
+    opencl_kernel: str,
+    total_tiles: int,
+    cpu_count: int,
+) -> int:
+    env_override = os.environ.get("ULTRA_TILE_WORKERS")
+    if env_override is not None:
+        return min(max(1, int(env_override)), max(1, total_tiles))
+    if not opencl_kernel or binary_path.name != "ultra_cli_opencl":
+        return min(cpu_count, max(1, total_tiles))
+    info = _probe_gpu(binary_path)
+    if not info:
+        return 1
+    vram_mb = info.get("vram_mb", 0)
+    max_alloc_mb = info.get("max_alloc_mb", 2048)
+    if vram_mb <= 0:
+        return 1
+
+    # 85% of total VRAM budget
+    vram_budget_mb = int(vram_mb * 0.85)
+    # Estimate memory per worker in MB:
+    # Batch buffer capped at max_alloc_mb (~2048 MB on NVIDIA) + surface/fixed buffers
+    worker_mem_mb = max(512, min(max_alloc_mb + 256, 2300))
+    max_workers_by_vram = max(1, vram_budget_mb // worker_mem_mb)
+
+    workers = min(max_workers_by_vram, cpu_count, max(1, total_tiles))
+    logger.info("🎮 [GPU Auto-scale] VRAM: %d MB (budget: %d MB) -> concurrency: %d workers (~%d MB/worker)",
+                vram_mb, vram_budget_mb, workers, worker_mem_mb)
+    return workers
 
 # Cross-process registry of in-flight C++ subprocesses (ultra_cli) keyed by
 # job_id. Backed by a multiprocessing.Manager so that worker processes
@@ -589,12 +629,13 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
     total = len(tiles)
     cpu_count = os.cpu_count() or 1
     total_cells = artifact.width * artifact.height
+    avg_cells_per_tile = total_cells // max(1, total)
 
     pending_tiles = []
     for tile in tiles:
         sig_path = out_dir / f"coverage_x{tile.x0}_y{tile.y0}.signal_i16le.bin"
         if sig_path.exists():
-            _advance_tile_progress_throttled(job_id, total)
+            _advance_tile_progress_throttled(job_id, total, cells_per_tile=avg_cells_per_tile)
         else:
             pending_tiles.append(tile)
 
@@ -603,15 +644,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
         workers = 1
         threads_per_call = 1 if is_gpu else cpu_count
     else:
-        env_workers = os.environ.get("ULTRA_TILE_WORKERS")
-        if env_workers is not None:
-            workers = min(
-                max(1, int(env_workers)),
-                max(1, len(pending_tiles)),
-            )
-        else:
-            default_workers = 1 if is_gpu else cpu_count
-            workers = min(default_workers, len(pending_tiles))
+        workers = get_optimal_gpu_workers(binary, opencl_kernel, len(pending_tiles), cpu_count)
         threads_per_call = 1 if is_gpu else max(1, cpu_count // workers)
 
     job = jobs.get(job_id)
@@ -685,7 +718,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                     job_pid_list.remove(proc.pid)
                 except ValueError:
                     pass
-            _advance_tile_progress_throttled(job_id, total)
+            _advance_tile_progress_throttled(job_id, total, cells_per_tile=avg_cells_per_tile)
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
             future_to_tile = {
@@ -715,7 +748,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                         model="itm_projected_grid",
                         message=f"tile ({tile.x0},{tile.y0}) failed: {exc}",
                     )
-                _advance_tile_progress_throttled(job_id, total)
+                _advance_tile_progress_throttled(job_id, total, cells_per_tile=avg_cells_per_tile)
                 if is_cancel_requested(job_id):
                     executor.shutdown(wait=False, cancel_futures=True)
                     return NativeRunResult(
@@ -743,7 +776,11 @@ def _advance_tile_progress(job_id: str, total: int) -> None:
 
 
 def _advance_tile_progress_throttled(
-    job_id: str, total: int, *, min_interval_s: float = 0.25,
+    job_id: str,
+    total: int,
+    cells_per_tile: int = 0,
+    *,
+    min_interval_s: float = 0.25,
 ) -> None:
     """Like :func:`_advance_tile_progress` but coalesces disk writes.
 
@@ -767,8 +804,12 @@ def _advance_tile_progress_throttled(
     first_tile_ts = tiles_meta.setdefault("first_tile_ts", now)
     elapsed = max(0.01, now - first_tile_ts)
     rate = done / elapsed
-    logger.info("  ↳ [Job %s] Tile %d/%d completed (%.1f%%) [~%.2f tiles/sec, ~%.1fs remaining]",
-                job_id, done, total, (done / total) * 100, rate, (total - done) / max(0.01, rate))
+    cells_rate = (done * cells_per_tile) / elapsed if cells_per_tile > 0 else 0
+    speed_str = f"~{rate:.2f} tiles/s"
+    if cells_rate > 0:
+        speed_str += f" | ~{int(cells_rate):,} cells/s"
+    logger.info("  ↳ [Job %s] Tile %d/%d completed (%.1f%%) [%s, ~%.1fs remaining]",
+                job_id, done, total, (done / total) * 100, speed_str, (total - done) / max(0.01, rate))
 
     if last is None or (now - last) >= min_interval_s or is_last:
         persist_job(job_id, job)

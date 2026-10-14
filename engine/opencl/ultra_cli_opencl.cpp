@@ -338,18 +338,21 @@ int main(int argc, char **argv) {
     batch_size = (int)(((size_t)batch_size / local) * local);
     if (batch_size < 1) batch_size = 1;
 
-    fprintf(stderr, "tile: x0=%d y0=%d w=%d h=%d  cells=%d  max_segs=%d  stride=%d  batch=%d  wg=%zu\n",
-            tile_x0, tile_y0, tile_w, tile_h, total_cells, max_segments, stride_prof, batch_size, local);
+    size_t alloc_batch = ((size_t)batch_size + local - 1) / local * local;
+    if (alloc_batch < local) alloc_batch = local;
+
+    fprintf(stderr, "tile: x0=%d y0=%d w=%d h=%d  cells=%d  max_segs=%d  stride=%d  batch=%d  alloc_batch=%zu  wg=%zu\n",
+            tile_x0, tile_y0, tile_w, tile_h, total_cells, max_segments, stride_prof, batch_size, alloc_batch, local);
 
     /* ---- allocate GPU buffers ---- */
     cl_mem d_surf = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                    surf_cells * sizeof(int16_t), surface.data(), &e);
     CL_CHECK(e);
     cl_mem d_prof = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
-                                   (size_t)batch_size * stride_prof * elem_size, NULL, &e);
+                                   alloc_batch * stride_prof * elem_size, NULL, &e);
     CL_CHECK(e);
     cl_mem d_scratch = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
-                                      (size_t)batch_size * D1THX_SCRATCH_LEN * elem_size, NULL, &e);
+                                      alloc_batch * D1THX_SCRATCH_LEN * elem_size, NULL, &e);
     CL_CHECK(e);
     cl_mem d_signal = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
                                      (size_t)total_cells * sizeof(int16_t), NULL, &e);
@@ -359,10 +362,10 @@ int main(int argc, char **argv) {
     CL_CHECK(e);
     /* dbloss + errnum buffers for itm_p2p_kernel */
     cl_mem d_loss = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
-                                   (size_t)batch_size * elem_size, NULL, &e);
+                                   alloc_batch * elem_size, NULL, &e);
     CL_CHECK(e);
     cl_mem d_err = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
-                                  (size_t)batch_size * sizeof(int), NULL, &e);
+                                  alloc_batch * sizeof(int), NULL, &e);
     CL_CHECK(e);
     CL_CHECK(clSetKernelArg(kern_itm, 13, sizeof(cl_mem), &d_loss));
     CL_CHECK(clSetKernelArg(kern_itm, 14, sizeof(cl_mem), &d_err));
@@ -412,9 +415,9 @@ int main(int argc, char **argv) {
 
     /* ---- batch loop ---- */
     std::vector<double> cpu_prof_buf;
-    if (cpu_profiles) cpu_prof_buf.resize((size_t)batch_size * stride_prof);
-    std::vector<double> loss_buf(batch_size);
-    std::vector<int> err_buf(batch_size);
+    if (cpu_profiles) cpu_prof_buf.resize(alloc_batch * stride_prof);
+    std::vector<double> loss_buf(alloc_batch);
+    std::vector<int> err_buf(alloc_batch);
 
     for (int batch_start = 0; batch_start < total_cells; batch_start += batch_size) {
         int batch_count = std::min(batch_size, total_cells - batch_start);
@@ -464,6 +467,7 @@ int main(int argc, char **argv) {
         }
 
         /* Run itm_p2p_kernel — global size = batch_count (kernel uses get_global_id) */
+        CL_CHECK(clSetKernelArg(kern_itm, 15, sizeof(int), &batch_count));
         size_t global = (size_t)batch_count;
         global = ((global + local - 1) / local) * local;
         CL_CHECK(clEnqueueNDRangeKernel(q, kern_itm, 1, NULL, &global, &local, 0, NULL, NULL));

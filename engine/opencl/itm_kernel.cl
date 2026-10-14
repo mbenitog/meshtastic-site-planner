@@ -1014,11 +1014,11 @@ __kernel void itm_p2p_kernel(
     real_t frq_mhz, int radio_climate, int pol,
     real_t conf, real_t rel,
     __global real_t* out_dbloss,       /* num_profiles */
-    __global int* out_errnum)          /* num_profiles */
+    __global int* out_errnum,          /* num_profiles */
+    int num_profiles)
 {
     int gid = get_global_id(0);
-    int n = get_global_size(0);
-    if (gid >= n) return;
+    if (gid >= num_profiles) return;
 
     itm_state st;
     /* zero-initialise state */

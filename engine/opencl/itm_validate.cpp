@@ -273,15 +273,15 @@ static VariantResult run_variant(const DevicePick &pick, const char *kernel_src,
     cl_mem d_prof = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                    prof_bytes.size(), prof_bytes.data(), &e);
     CL_CHECK(e);
-    size_t scratch_elems = (size_t)num_cells * 256;   /* D1THX_SCRATCH_LEN */
+    size_t scratch_elems = (size_t)global * 256;   /* D1THX_SCRATCH_LEN */
     cl_mem d_scratch = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
                                       scratch_elems * elem_bytes, NULL, &e);
     CL_CHECK(e);
     cl_mem d_loss = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
-                                   (size_t)num_cells * elem_bytes, NULL, &e);
+                                   (size_t)global * elem_bytes, NULL, &e);
     CL_CHECK(e);
     cl_mem d_err = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
-                                  (size_t)num_cells * sizeof(int), NULL, &e);
+                                  (size_t)global * sizeof(int), NULL, &e);
     CL_CHECK(e);
 
     if (use_double) {
@@ -301,6 +301,7 @@ static VariantResult run_variant(const DevicePick &pick, const char *kernel_src,
         CL_CHECK(clSetKernelArg(kern,12, sizeof(double), &_rel));
         CL_CHECK(clSetKernelArg(kern,13, sizeof(d_loss), &d_loss));
         CL_CHECK(clSetKernelArg(kern,14, sizeof(d_err), &d_err));
+        CL_CHECK(clSetKernelArg(kern,15, sizeof(int), &num_cells));
     } else {
         float _tht=(float)tht_m,_rht=(float)rht_m,_eps=(float)eps,_sgm=(float)sgm,
               _eno=(float)eno,_frq=(float)frq,_conf=(float)conf,_rel=(float)rel;
@@ -319,6 +320,7 @@ static VariantResult run_variant(const DevicePick &pick, const char *kernel_src,
         CL_CHECK(clSetKernelArg(kern,12, sizeof(float), &_rel));
         CL_CHECK(clSetKernelArg(kern,13, sizeof(d_loss), &d_loss));
         CL_CHECK(clSetKernelArg(kern,14, sizeof(d_err), &d_err));
+        CL_CHECK(clSetKernelArg(kern,15, sizeof(int), &num_cells));
     }
 
     CL_CHECK(clEnqueueNDRangeKernel(q, kern, 1, NULL, &global, &local, 0, NULL, NULL));

@@ -120,12 +120,23 @@ def run_tiled_native_ultra(
     """
     binary = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli"))
     opencl_kernel = os.environ.get("ULTRA_OPENCL_KERNEL", "")
+    if not opencl_kernel:
+        for cand in [Path("/usr/local/share/ultra/itm_kernel.cl"), Path("engine/opencl/itm_kernel.cl")]:
+            if cand.exists():
+                opencl_kernel = str(cand.resolve())
+                break
     if opencl_kernel:
         # When the OpenCL kernel path is set, auto-select the OpenCL binary
-        # unless ULTRA_CLI was explicitly set to something else.
-        default_ocl_binary = "engine/build/ultra_cli_opencl"
-        if binary.name == "ultra_cli" and Path(default_ocl_binary).exists():
-            binary = Path(default_ocl_binary)
+        # unless ULTRA_CLI was explicitly pointed at something custom.
+        candidates = [
+            binary.with_name("ultra_cli_opencl"),
+            Path("/usr/local/bin/ultra_cli_opencl"),
+            Path("engine/build/ultra_cli_opencl"),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                binary = candidate
+                break
     if not binary.exists():
         return NativeRunResult(
             status="missing_binary",

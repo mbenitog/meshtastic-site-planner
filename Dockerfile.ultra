@@ -43,10 +43,12 @@ COPY backend backend
 COPY --from=native-build /usr/local/bin/ultra_cli /usr/local/bin/ultra_cli
 COPY --from=native-build /usr/local/bin/ultra_cli_opencl /usr/local/bin/ultra_cli_opencl
 COPY --from=native-build /usr/local/share/ultra/itm_kernel.cl /usr/local/share/ultra/itm_kernel.cl
-ENV ULTRA_CLI=/usr/local/bin/ultra_cli
+ENV ULTRA_CLI=/usr/local/bin/ultra_cli_opencl
+ENV ULTRA_OPENCL_KERNEL=/usr/local/share/ultra/itm_kernel.cl
 ENV PYTHONPATH=/app
-# To enable GPU: set ULTRA_OPENCL_KERNEL=/usr/local/share/ultra/itm_kernel.cl
-# and ensure an OpenCL ICD is available (e.g. mount /etc/OpenCL/vendors
-# from the host, or install pocl-opencl-icd for CPU fallback).
+# Default uses GPU (OpenCL). For CPU-only fallback, set:
+#   ULTRA_CLI=/usr/local/bin/ultra_cli
+#   ULTRA_OPENCL_KERNEL=
+# Ensure OpenCL ICD is available (e.g. mount /etc/OpenCL/vendors or install pocl-opencl-icd).
 EXPOSE 8000
 CMD ["uvicorn", "backend.ultra.main:app", "--host", "0.0.0.0", "--port", "8000"]

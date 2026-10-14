@@ -25,7 +25,8 @@ RUN g++ -O2 -std=gnu++11 -w \
   -o /usr/local/bin/ultra_cli_opencl \
   engine/opencl/ultra_cli_opencl.cpp -lOpenCL
 # Install the kernel where the runner can find it
-RUN cp engine/opencl/itm_kernel.cl /usr/local/share/ultra/itm_kernel.cl
+RUN mkdir -p /usr/local/share/ultra \
+  && cp engine/opencl/itm_kernel.cl /usr/local/share/ultra/itm_kernel.cl
 
 FROM python:3.12-slim
 # ocl-icd-libopencl1 provides the ICD loader at runtime; the actual
@@ -43,6 +44,7 @@ COPY --from=native-build /usr/local/bin/ultra_cli /usr/local/bin/ultra_cli
 COPY --from=native-build /usr/local/bin/ultra_cli_opencl /usr/local/bin/ultra_cli_opencl
 COPY --from=native-build /usr/local/share/ultra/itm_kernel.cl /usr/local/share/ultra/itm_kernel.cl
 ENV ULTRA_CLI=/usr/local/bin/ultra_cli
+ENV PYTHONPATH=/app
 # To enable GPU: set ULTRA_OPENCL_KERNEL=/usr/local/share/ultra/itm_kernel.cl
 # and ensure an OpenCL ICD is available (e.g. mount /etc/OpenCL/vendors
 # from the host, or install pocl-opencl-icd for CPU fallback).

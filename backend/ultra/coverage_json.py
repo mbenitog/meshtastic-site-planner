@@ -5,16 +5,22 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import URLError
+import concurrent.futures
 import hashlib
 import json
+import logging
+import os
 import subprocess
 import math
 
 import numpy as np
 
 
+logger = logging.getLogger("uvicorn.error")
+
 API_COVERAGES_URL = "https://api-coverages.idee.es/collections"
 DTM_5M_25830 = "EL.ElevationGridCoverage_25830_5_PB"
+DEFAULT_DOWNLOAD_CONCURRENCY = int(os.environ.get("IGN_DOWNLOAD_CONCURRENCY", "8"))
 
 
 @dataclass
@@ -221,25 +227,38 @@ class CoverageApiClient:
             )
         stride_cells = int((max_cells_per_request) ** 0.5)
         stride_m = stride_cells * cell_size
-        tiles: list[CoverageGrid] = []
+        sub_boxes: list[tuple[float, float, float, float]] = []
         x = min_x
         while x < max_x - 1e-6:
             tile_max_x = min(x + stride_m, max_x)
             y = min_y
             while y < max_y - 1e-6:
                 tile_max_y = min(y + stride_m, max_y)
-                tiles.append(
-                    self.fetch_grid(
-                        collection_id=collection_id,
-                        min_x=x,
-                        min_y=y,
-                        max_x=tile_max_x,
-                        max_y=tile_max_y,
-                        timeout=timeout,
-                    )
-                )
+                sub_boxes.append((x, y, tile_max_x, tile_max_y))
                 y = tile_max_y
             x = tile_max_x
+
+        tiles: list[CoverageGrid] = []
+        max_workers = min(DEFAULT_DOWNLOAD_CONCURRENCY, max(1, len(sub_boxes)))
+        logger.info("  📥 [IGN DTM] Fetching '%s': %d sub-tiles (%d workers parallel)", collection_id, len(sub_boxes), max_workers)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(
+                    self.fetch_grid,
+                    collection_id=collection_id,
+                    min_x=bx0,
+                    min_y=by0,
+                    max_x=bx1,
+                    max_y=by1,
+                    timeout=timeout,
+                )
+                for (bx0, by0, bx1, by1) in sub_boxes
+            ]
+            for fut in concurrent.futures.as_completed(futures):
+                tiles.append(fut.result())
+        logger.info("  📦 [IGN DTM] '%s' download complete: %d/%d tiles received, stitching...",
+                    collection_id, len(tiles), len(sub_boxes))
+
         return stitch_coverage_grids(tiles, min_x, min_y, max_x, max_y, cell_size)
 
 

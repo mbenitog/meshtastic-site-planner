@@ -199,6 +199,25 @@ int main(int argc, char **argv) {
     if (env_plat) forced_plat = atoi(env_plat);
     if (env_dev)  forced_dev  = atoi(env_dev);
 
+    bool probe_only = false;
+    for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--probe") == 0) probe_only = true;
+    if (probe_only) {
+        DevicePick p;
+        if (pick_device(forced_plat, forced_dev, &p) != 0) {
+            printf("{\"status\":\"error\",\"message\":\"no OpenCL devices found\"}\n");
+            return 1;
+        }
+        cl_ulong gmem = 0, max_alloc = 0;
+        clGetDeviceInfo(p.device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(gmem), &gmem, NULL);
+        clGetDeviceInfo(p.device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
+        printf("{\"status\":\"ok\",\"device\":\"%s\",\"compute_units\":%u,\"has_fp64\":%s,\"vram_bytes\":%llu,\"vram_mb\":%llu,\"max_alloc_mb\":%llu}\n",
+               p.name, p.compute_units, p.has_fp64 ? "true" : "false",
+               (unsigned long long)gmem,
+               (unsigned long long)(gmem / (1024 * 1024)),
+               (unsigned long long)(max_alloc / (1024 * 1024)));
+        return 0;
+    }
+
     /* Standard ultra_cli args (same as ultra_main.cpp) */
     const char *surface_path = arg_s(argc, argv, "--surface");
     ok &= require(surface_path != nullptr, "--surface");
@@ -329,10 +348,49 @@ int main(int argc, char **argv) {
     if (local > wg_max) local = wg_max;
     if (local < 1) local = 1;
 
+    /* ---- query VRAM and compute budget (default 85% of global VRAM) ---- */
+    cl_ulong global_mem = 0;
+    clGetDeviceInfo(pick.device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem), &global_mem, NULL);
+    cl_ulong max_alloc = 0;
+    clGetDeviceInfo(pick.device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
+
+    double vram_frac = 0.85;
+    const char *env_frac = getenv("ULTRA_VRAM_FRACTION");
+    if (env_frac) {
+        double f = atof(env_frac);
+        if (f > 0.10 && f <= 0.98) vram_frac = f;
+    }
+
+    size_t surf_bytes = surf_cells * sizeof(int16_t);
+    size_t out_bytes = (size_t)total_cells * (sizeof(int16_t) + sizeof(uint8_t));
+    size_t fixed_bytes = surf_bytes + out_bytes;
+
+    size_t mem_budget = (size_t)512 * 1024 * 1024;
+    if (global_mem > 0) {
+        size_t target_total = (size_t)((double)global_mem * vram_frac);
+        if (target_total > fixed_bytes + 64 * 1024 * 1024) {
+            mem_budget = target_total - fixed_bytes;
+        } else {
+            mem_budget = (size_t)256 * 1024 * 1024;
+        }
+    }
+    const char *env_budget = getenv("ULTRA_MEM_BUDGET_MB");
+    if (env_budget) {
+        long mb = atol(env_budget);
+        if (mb > 32) mem_budget = (size_t)mb * 1024 * 1024;
+    }
+
     /* ---- batch sizing (bound VRAM for profile + scratch pools) ---- */
-    size_t bytes_per_item = (size_t)(stride_prof + D1THX_SCRATCH_LEN) * elem_size;
-    size_t mem_budget = (size_t)512 * 1024 * 1024;  /* 512 MB */
+    size_t bytes_per_item = (size_t)(stride_prof + D1THX_SCRATCH_LEN + 2) * elem_size;
     int batch_size = (int)(mem_budget / bytes_per_item);
+
+    /* ensure d_prof does not exceed max_alloc */
+    if (max_alloc > 0) {
+        int max_prof_items = (int)(max_alloc / ((size_t)stride_prof * elem_size));
+        if (max_prof_items > 0 && batch_size > max_prof_items) {
+            batch_size = max_prof_items;
+        }
+    }
     batch_size = std::min(batch_size, total_cells);
     /* round down to multiple of local */
     batch_size = (int)(((size_t)batch_size / local) * local);
@@ -341,6 +399,10 @@ int main(int argc, char **argv) {
     size_t alloc_batch = ((size_t)batch_size + local - 1) / local * local;
     if (alloc_batch < local) alloc_batch = local;
 
+    fprintf(stderr, "device: %s  vram=%lluMB  budget=%lluMB (%.0f%%)  max_alloc=%lluMB\n",
+            pick.name, (unsigned long long)(global_mem / (1024 * 1024)),
+            (unsigned long long)(mem_budget / (1024 * 1024)), vram_frac * 100.0,
+            (unsigned long long)(max_alloc / (1024 * 1024)));
     fprintf(stderr, "tile: x0=%d y0=%d w=%d h=%d  cells=%d  max_segs=%d  stride=%d  batch=%d  alloc_batch=%zu  wg=%zu\n",
             tile_x0, tile_y0, tile_w, tile_h, total_cells, max_segments, stride_prof, batch_size, alloc_batch, local);
 

@@ -60,6 +60,63 @@ jobs: dict[str, dict] = {}
 JOB_ROOT = Path(".cache/ultra-jobs")
 TILE_MAX_CELLS = 250_000
 SINGLE_TILE_CELL_THRESHOLD = 1_000_000
+_cached_gpu_tile_cells: int | None = None
+
+
+def _resolve_native_binary() -> tuple[Path, str]:
+    binary = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli")).resolve()
+    opencl_kernel = os.environ.get("ULTRA_OPENCL_KERNEL", "")
+    if not opencl_kernel:
+        for cand in [Path("/usr/local/share/ultra/itm_kernel.cl"), Path("engine/opencl/itm_kernel.cl")]:
+            if cand.exists():
+                opencl_kernel = str(cand.resolve())
+                break
+    if opencl_kernel:
+        candidates = [
+            binary.with_name("ultra_cli_opencl"),
+            Path("/usr/local/bin/ultra_cli_opencl"),
+            Path("engine/build/ultra_cli_opencl"),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                binary = candidate.resolve()
+                break
+    return binary, opencl_kernel
+
+
+def get_optimal_tile_cells(binary_path: Path, opencl_kernel: str) -> int:
+    global _cached_gpu_tile_cells
+    env_override = os.environ.get("ULTRA_TILE_MAX_CELLS")
+    if env_override:
+        return max(50_000, int(env_override))
+    if not opencl_kernel or binary_path.name != "ultra_cli_opencl":
+        return TILE_MAX_CELLS
+    if _cached_gpu_tile_cells is not None:
+        return _cached_gpu_tile_cells
+
+    try:
+        import subprocess
+        proc = subprocess.run([str(binary_path), "--probe"], capture_output=True, text=True, timeout=5)
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout)
+            vram_mb = data.get("vram_mb", 0)
+            if vram_mb >= 12000:
+                _cached_gpu_tile_cells = 4_000_000
+            elif vram_mb >= 6000:
+                _cached_gpu_tile_cells = 2_000_000
+            elif vram_mb >= 3000:
+                _cached_gpu_tile_cells = 1_000_000
+            elif vram_mb >= 1500:
+                _cached_gpu_tile_cells = 500_000
+            else:
+                _cached_gpu_tile_cells = 250_000
+            logger.info("🎮 [GPU Auto-scale] Detected %s (%d MB VRAM) -> optimal tile size: %d cells",
+                        data.get("device", "GPU"), vram_mb, _cached_gpu_tile_cells)
+            return _cached_gpu_tile_cells
+    except Exception as exc:
+        logger.warning("Could not probe OpenCL device: %s", exc)
+    _cached_gpu_tile_cells = 250_000
+    return _cached_gpu_tile_cells
 
 # Cross-process registry of in-flight C++ subprocesses (ultra_cli) keyed by
 # job_id. Backed by a multiprocessing.Manager so that worker processes
@@ -332,14 +389,16 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
         job["status"] = "running_native"
         job["message"] = "Running ITM/Longley-Rice over measured projected-grid terrain in tiles."
         set_progress(job, "compute", 0.4)
-        tiles = plan_tiles(artifact.width, artifact.height, TILE_MAX_CELLS)
+        binary, opencl_kernel = _resolve_native_binary()
+        tile_max_cells = get_optimal_tile_cells(binary, opencl_kernel)
+        tiles = plan_tiles(artifact.width, artifact.height, tile_max_cells)
         job["tiles"] = {
             "count": len(tiles),
             "completed": 0,
         }
         persist_job(job_id, job)
         logger.info("⏳ [Job %s] Phase 2/3: Computing ITM RF coverage across %d tiles (max %d cells/tile)...",
-                    job_id, len(tiles), TILE_MAX_CELLS)
+                    job_id, len(tiles), tile_max_cells)
 
         t_compute = time.perf_counter()
         native_result = _run_tiles_with_progress(
@@ -508,23 +567,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
     from pathlib import Path
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    binary = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli")).resolve()
-    opencl_kernel = os.environ.get("ULTRA_OPENCL_KERNEL", "")
-    if not opencl_kernel:
-        for cand in [Path("/usr/local/share/ultra/itm_kernel.cl"), Path("engine/opencl/itm_kernel.cl")]:
-            if cand.exists():
-                opencl_kernel = str(cand.resolve())
-                break
-    if opencl_kernel:
-        candidates = [
-            binary.with_name("ultra_cli_opencl"),
-            Path("/usr/local/bin/ultra_cli_opencl"),
-            Path("engine/build/ultra_cli_opencl"),
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                binary = candidate.resolve()
-                break
+    binary, opencl_kernel = _resolve_native_binary()
     if not binary.exists():
         from .runner import NativeRunResult
         return NativeRunResult(
@@ -555,9 +598,10 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
         else:
             pending_tiles.append(tile)
 
+    is_gpu = (binary.name == "ultra_cli_opencl" and bool(opencl_kernel))
     if total_cells <= SINGLE_TILE_CELL_THRESHOLD or len(pending_tiles) <= 1:
         workers = 1
-        threads_per_call = cpu_count
+        threads_per_call = 1 if is_gpu else cpu_count
     else:
         env_workers = os.environ.get("ULTRA_TILE_WORKERS")
         if env_workers is not None:
@@ -566,8 +610,9 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                 max(1, len(pending_tiles)),
             )
         else:
-            workers = min(cpu_count, len(pending_tiles))
-        threads_per_call = max(1, cpu_count // workers)
+            default_workers = 1 if is_gpu else cpu_count
+            workers = min(default_workers, len(pending_tiles))
+        threads_per_call = 1 if is_gpu else max(1, cpu_count // workers)
 
     job = jobs.get(job_id)
     if job is not None:

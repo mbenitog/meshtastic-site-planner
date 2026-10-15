@@ -6,6 +6,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 import concurrent.futures
 import hashlib
+import json
 import logging
 import os
 import re
@@ -71,22 +72,29 @@ def _extract_asc_from_multipart(text: str) -> str:
 
 def parse_arcgrid(text: str) -> ArcGrid:
     asc = _extract_asc_from_multipart(text)
-    lines = [line.strip() for line in asc.splitlines() if line.strip()]
     header: dict[str, float] = {}
-    data_start = 0
-    for i, line in enumerate(lines):
-        parts = line.split()
-        key = parts[0].lower()
-        if key not in {"ncols", "nrows", "xllcorner", "yllcorner", "cellsize", "nodata_value"}:
-            data_start = i
+    pos = 0
+    # Parse header lines without splitting the entire multi-megabyte string into millions of python objects
+    for _ in range(12):
+        line_start = pos
+        nl = asc.find("\n", pos)
+        if nl == -1:
             break
-        header[key] = float(parts[1])
+        line = asc[pos:nl].strip()
+        pos = nl + 1
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].lower() in {"ncols", "nrows", "xllcorner", "yllcorner", "cellsize", "nodata_value"}:
+            header[parts[0].lower()] = float(parts[1])
+        else:
+            pos = line_start
+            break
 
     ncols = int(header["ncols"])
     nrows = int(header["nrows"])
     nodata_value = header.get("nodata_value")
-    data_str = " ".join(lines[data_start:])
-    arr = np.fromstring(data_str, sep=" ", dtype=np.float32)
+    arr = np.fromstring(asc[pos:], sep=" ", dtype=np.float32)
     if arr.size != ncols * nrows:
         raise ValueError(f"ArcGrid size mismatch: expected {ncols * nrows}, got {arr.size}")
     return ArcGrid(
@@ -139,9 +147,41 @@ class IgnDsmClient:
             "max_x": f"{max_x:.3f}",
             "max_y": f"{max_y:.3f}",
         }
-        cache_path = self.cache_dir / f"{_cache_key(key_params)}.asc"
+        cache_key = _cache_key(key_params)
+        cache_npy = self.cache_dir / f"{cache_key}.npy"
+        cache_meta = self.cache_dir / f"{cache_key}.meta.json"
+        if cache_npy.exists() and cache_meta.exists():
+            try:
+                meta = json.loads(cache_meta.read_text(encoding="utf-8"))
+                arr = np.load(cache_npy)
+                return ArcGrid(
+                    ncols=meta["ncols"],
+                    nrows=meta["nrows"],
+                    xllcorner=meta["xllcorner"],
+                    yllcorner=meta["yllcorner"],
+                    cellsize=meta["cellsize"],
+                    values=arr,
+                    nodata=meta.get("nodata"),
+                )
+            except Exception:
+                pass
+
+        cache_path = self.cache_dir / f"{cache_key}.asc"
         if cache_path.exists():
-            return parse_arcgrid(cache_path.read_text(encoding="utf-8"))
+            grid = parse_arcgrid(cache_path.read_text(encoding="utf-8"))
+            try:
+                np.save(cache_npy, grid.values)
+                cache_meta.write_text(json.dumps({
+                    "ncols": grid.ncols,
+                    "nrows": grid.nrows,
+                    "xllcorner": grid.xllcorner,
+                    "yllcorner": grid.yllcorner,
+                    "cellsize": grid.cellsize,
+                    "nodata": grid.nodata,
+                }), encoding="utf-8")
+            except Exception:
+                pass
+            return grid
 
         # The WCS endpoint accepts normal query encoding, but has been observed
         # to reset connections when subset parentheses are percent-encoded.
@@ -158,7 +198,20 @@ class IgnDsmClient:
             )
             text = result.stdout.decode("utf-8")
         cache_path.write_text(text, encoding="utf-8")
-        return parse_arcgrid(text)
+        grid = parse_arcgrid(text)
+        try:
+            np.save(cache_npy, grid.values)
+            cache_meta.write_text(json.dumps({
+                "ncols": grid.ncols,
+                "nrows": grid.nrows,
+                "xllcorner": grid.xllcorner,
+                "yllcorner": grid.yllcorner,
+                "cellsize": grid.cellsize,
+                "nodata": grid.nodata,
+            }), encoding="utf-8")
+        except Exception:
+            pass
+        return grid
 
     def fetch_arcgrid_tiled(
         self,

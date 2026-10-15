@@ -32,6 +32,7 @@ class CoverageGrid:
     min_y: float
     max_y: float
     values: list[float | None] | np.ndarray
+    fill_on_init: bool = True
 
     def __post_init__(self) -> None:
         if isinstance(self.values, np.ndarray):
@@ -42,8 +43,8 @@ class CoverageGrid:
                 dtype=np.float32,
             ).reshape(self.height, self.width)
         valid = ~np.isnan(arr)
-        filled = arr.copy()
-        if not bool(valid.all()):
+        if self.fill_on_init and not bool(valid.all()):
+            filled = arr.copy()
             # Pass 1: top then left (propagates valid rows/columns inward).
             shifted = filled[1:, :]
             mask = (~valid[1:, :]) & valid[:-1, :]
@@ -66,6 +67,8 @@ class CoverageGrid:
             shifted[mask] = filled[:, 1:][mask]
             filled[:, :-1] = shifted
             valid[:, :-1] |= valid[:, 1:]
+        else:
+            filled = arr
         self._values_arr = arr
         self._valid = valid
         self._filled = filled
@@ -119,17 +122,22 @@ def _cache_key(params: dict[str, str]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def parse_coverage_json(text: str) -> CoverageGrid:
+def parse_coverage_json(text: str, *, fill_on_init: bool = True) -> CoverageGrid:
     payload = json.loads(text)
     axes = payload["domain"]["axes"]
     x_axis = axes["x"]
     y_axis = axes["y"]
     range_obj = next(iter(payload["ranges"].values()))
-    values = [None if v is None or (isinstance(v, float) and math.isnan(v)) else float(v) for v in range_obj["values"]]
+    raw_vals = range_obj["values"]
+    arr = np.fromiter(
+        (np.nan if v is None or (isinstance(v, float) and math.isnan(v)) else v for v in raw_vals),
+        dtype=np.float32,
+        count=len(raw_vals),
+    )
     width = int(x_axis["num"])
     height = int(y_axis["num"])
-    if len(values) != width * height:
-        raise ValueError(f"CoverageJSON size mismatch: expected {width * height}, got {len(values)}")
+    if arr.size != width * height:
+        raise ValueError(f"CoverageJSON size mismatch: expected {width * height}, got {arr.size}")
     y0 = float(y_axis["start"])
     y1 = float(y_axis["stop"])
     return CoverageGrid(
@@ -139,7 +147,8 @@ def parse_coverage_json(text: str) -> CoverageGrid:
         max_x=max(float(x_axis["start"]), float(x_axis["stop"])),
         min_y=min(y0, y1),
         max_y=max(y0, y1),
-        values=values,
+        values=arr,
+        fill_on_init=fill_on_init,
     )
 
 
@@ -156,7 +165,8 @@ class CoverageApiClient:
         min_y: float,
         max_x: float,
         max_y: float,
-        timeout: float = 120.0,
+        timeout: float = 35.0,
+        fill_on_init: bool = True,
     ) -> CoverageGrid:
         params = {
             "bbox": f"{min_x:.3f},{min_y:.3f},{max_x:.3f},{max_y:.3f}",
@@ -164,9 +174,42 @@ class CoverageApiClient:
             "f": "json",
         }
         key_params = {"collection": collection_id, **params}
-        cache_path = self.cache_dir / f"{_cache_key(key_params)}.json"
+        cache_key = _cache_key(key_params)
+        cache_npy = self.cache_dir / f"{cache_key}.npy"
+        cache_meta = self.cache_dir / f"{cache_key}.meta.json"
+        if cache_npy.exists() and cache_meta.exists():
+            try:
+                meta = json.loads(cache_meta.read_text(encoding="utf-8"))
+                arr = np.load(cache_npy)
+                return CoverageGrid(
+                    width=meta["width"],
+                    height=meta["height"],
+                    min_x=meta["min_x"],
+                    max_x=meta["max_x"],
+                    min_y=meta["min_y"],
+                    max_y=meta["max_y"],
+                    values=arr,
+                    fill_on_init=fill_on_init,
+                )
+            except Exception:
+                pass
+
+        cache_path = self.cache_dir / f"{cache_key}.json"
         if cache_path.exists():
-            return parse_coverage_json(cache_path.read_text(encoding="utf-8"))
+            grid = parse_coverage_json(cache_path.read_text(encoding="utf-8"), fill_on_init=fill_on_init)
+            try:
+                np.save(cache_npy, grid.values)
+                cache_meta.write_text(json.dumps({
+                    "width": grid.width,
+                    "height": grid.height,
+                    "min_x": grid.min_x,
+                    "max_x": grid.max_x,
+                    "min_y": grid.min_y,
+                    "max_y": grid.max_y,
+                }), encoding="utf-8")
+            except Exception:
+                pass
+            return grid
 
         url = f"{API_COVERAGES_URL}/{collection_id}/coverage?{urlencode(params, safe=',')}"
         req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -184,7 +227,20 @@ class CoverageApiClient:
                     )
                     text = result.stdout.decode("utf-8")
                 cache_path.write_text(text, encoding="utf-8")
-                return parse_coverage_json(text)
+                grid = parse_coverage_json(text, fill_on_init=fill_on_init)
+                try:
+                    np.save(cache_npy, grid.values)
+                    cache_meta.write_text(json.dumps({
+                        "width": grid.width,
+                        "height": grid.height,
+                        "min_x": grid.min_x,
+                        "max_x": grid.max_x,
+                        "min_y": grid.min_y,
+                        "max_y": grid.max_y,
+                    }), encoding="utf-8")
+                except Exception:
+                    pass
+                return grid
             except Exception as exc:
                 last_error = exc
                 import time
@@ -245,6 +301,7 @@ class CoverageApiClient:
                     max_x=bx1,
                     max_y=by1,
                     timeout=timeout,
+                    fill_on_init=False,
                 )
                 for (bx0, by0, bx1, by1) in sub_boxes
             ]

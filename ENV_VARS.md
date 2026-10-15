@@ -49,17 +49,22 @@ Variables evaluadas directamente por el binario C++ OpenCL (`ultra_cli_opencl`):
 
 | Variable | Valor por defecto | Tipo | Descripción |
 | :--- | :--- | :--- | :--- |
+| `ULTRA_OPENCL_DEVICES` | *Auto-detección inteligente* | Cadena (separada por comas) | **Selección Multi-GPU**. Permite especificar qué dispositivos OpenCL utilizar en paralelo. Por defecto filtra automáticamente CPUs y GPUs integradas si hay tarjetas dedicadas. Admite índices (`0,1`), nombres/subcadenas (`"RTX 2070, RTX 3060"` o `"NVIDIA"`), o `"all_gpu"`. |
+| `ULTRA_OPENCL_DEVICE` | *Auto-detectado* | Entero o Cadena | Dispositivo único OpenCL a seleccionar (ej. `0` o `1`). Si se define, fuerza el uso exclusivo de ese dispositivo. |
+| `ULTRA_OPENCL_PLATFORM` | *Primera compatible* | Cadena o Entero | Nombre o índice de la plataforma OpenCL a utilizar (ej. `NVIDIA CUDA`, `0`). |
 | `ULTRA_VRAM_FRACTION` | `0.85` | Float (`0.1` a `0.95`) | Fracción de la VRAM disponible que el motor OpenCL puede utilizar para reservar buffers de rayos y perfiles de elevación (0.85 = 85%). |
-| `ULTRA_MEM_BUDGET_MB` | *Auto-detectado por VRAM* | Entero (Megabytes) | Presupuesto máximo estricto de memoria en MB que el binario intentará alojar en el dispositivo OpenCL. |
-| `ULTRA_OPENCL_PLATFORM` | *Primera compatible* | Cadena o Entero | Nombre o índice de la plataforma OpenCL a utilizar (ej. `NVIDIA`, `Intel`, `AMD`, `0`, `1`). |
-| `ULTRA_OPENCL_DEVICE` | *Primera GPU compatible* | Cadena o Entero | Nombre o índice del dispositivo OpenCL dentro de la plataforma seleccionada (ej. `GeForce RTX 2070`, `0`, `1`). |
+| `ULTRA_MEM_BUDGET_MB` | *Auto-calculado por GPU/worker* | Entero (Megabytes) | Presupuesto máximo estricto de memoria en MB para los buffers de rayos y perfiles por cada worker. |
 
-### Ejemplo:
+### Ejemplos Multi-GPU:
 ```bash
-# Limitar el uso de VRAM al 80% en un dispositivo concreto
-export ULTRA_VRAM_FRACTION=0.80
-export ULTRA_OPENCL_PLATFORM="NVIDIA CUDA"
-export ULTRA_OPENCL_DEVICE="0"
+# Usar dos GPUs dedicadas en paralelo (reparto round-robin de teselas)
+export ULTRA_OPENCL_DEVICES="0,1"
+
+# Filtrar por marca/nombre evitando GPUs integradas de Intel
+export ULTRA_OPENCL_DEVICES="NVIDIA"
+
+# Usar exclusivamente la segunda GPU
+export ULTRA_OPENCL_DEVICES="1"
 ```
 
 ---

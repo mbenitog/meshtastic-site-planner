@@ -202,19 +202,90 @@ int main(int argc, char **argv) {
     bool probe_only = false;
     for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--probe") == 0) probe_only = true;
     if (probe_only) {
-        DevicePick p;
-        if (pick_device(forced_plat, forced_dev, &p) != 0) {
-            printf("{\"status\":\"error\",\"message\":\"no OpenCL devices found\"}\n");
+        cl_uint nplat = 0;
+        if (clGetPlatformIDs(0, NULL, &nplat) != CL_SUCCESS || nplat == 0) {
+            printf("{\"status\":\"error\",\"message\":\"no OpenCL platforms found\"}\n");
             return 1;
         }
-        cl_ulong gmem = 0, max_alloc = 0;
-        clGetDeviceInfo(p.device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(gmem), &gmem, NULL);
-        clGetDeviceInfo(p.device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
-        printf("{\"status\":\"ok\",\"device\":\"%s\",\"compute_units\":%u,\"has_fp64\":%s,\"vram_bytes\":%llu,\"vram_mb\":%llu,\"max_alloc_mb\":%llu}\n",
-               p.name, p.compute_units, p.has_fp64 ? "true" : "false",
-               (unsigned long long)gmem,
-               (unsigned long long)(gmem / (1024 * 1024)),
-               (unsigned long long)(max_alloc / (1024 * 1024)));
+        std::vector<cl_platform_id> plats(nplat);
+        clGetPlatformIDs(nplat, plats.data(), NULL);
+
+        struct DevInfo {
+            int platform_idx;
+            int device_idx;
+            char name[256];
+            const char *type_str;
+            cl_uint compute_units;
+            bool has_fp64;
+            cl_ulong gmem;
+            cl_ulong max_alloc;
+            int score;
+        };
+        std::vector<DevInfo> found_devs;
+        int best_idx = -1;
+        int best_score = -1;
+
+        for (cl_uint pi = 0; pi < nplat; pi++) {
+            cl_uint ndev = 0;
+            if (clGetDeviceIDs(plats[pi], CL_DEVICE_TYPE_ALL, 0, NULL, &ndev) != CL_SUCCESS || ndev == 0)
+                continue;
+            std::vector<cl_device_id> devs(ndev);
+            clGetDeviceIDs(plats[pi], CL_DEVICE_TYPE_ALL, ndev, devs.data(), NULL);
+            for (cl_uint di = 0; di < ndev; di++) {
+                if (forced_plat >= 0 && (int)pi != forced_plat) continue;
+                if (forced_dev >= 0 && (int)di != forced_dev) continue;
+
+                DevInfo d;
+                d.platform_idx = (int)pi;
+                d.device_idx = (int)di;
+                cl_device_type t = 0;
+                clGetDeviceInfo(devs[di], CL_DEVICE_TYPE, sizeof(t), &t, NULL);
+                d.type_str = (t == CL_DEVICE_TYPE_GPU) ? "GPU" : ((t == CL_DEVICE_TYPE_CPU) ? "CPU" : "ACCELERATOR");
+                d.has_fp64 = dev_has_ext(devs[di], "cl_khr_fp64") ? true : false;
+                clGetDeviceInfo(devs[di], CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(d.compute_units), &d.compute_units, NULL);
+                size_t nl = 0;
+                clGetDeviceInfo(devs[di], CL_DEVICE_NAME, sizeof(d.name), d.name, &nl);
+                d.name[nl < sizeof(d.name) ? nl : sizeof(d.name) - 1] = '\0';
+                clGetDeviceInfo(devs[di], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(d.gmem), &d.gmem, NULL);
+                clGetDeviceInfo(devs[di], CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(d.max_alloc), &d.max_alloc, NULL);
+
+                int score = 0;
+                if (t == CL_DEVICE_TYPE_GPU) score += 100;
+                if (d.has_fp64) score += 10;
+                score += (int)d.compute_units;
+                d.score = score;
+
+                if (best_idx < 0 || score > best_score) {
+                    best_score = score;
+                    best_idx = (int)found_devs.size();
+                }
+                found_devs.push_back(d);
+            }
+        }
+
+        if (found_devs.empty()) {
+            printf("{\"status\":\"error\",\"message\":\"no matching OpenCL devices found\"}\n");
+            return 1;
+        }
+
+        printf("{\"status\":\"ok\",\"devices\":[");
+        for (size_t i = 0; i < found_devs.size(); i++) {
+            const auto &d = found_devs[i];
+            printf("{\"platform\":%d,\"device\":%d,\"name\":\"%s\",\"type\":\"%s\",\"compute_units\":%u,\"has_fp64\":%s,\"vram_bytes\":%llu,\"vram_mb\":%llu,\"max_alloc_mb\":%llu}%s",
+                   d.platform_idx, d.device_idx, d.name, d.type_str, d.compute_units,
+                   d.has_fp64 ? "true" : "false",
+                   (unsigned long long)d.gmem,
+                   (unsigned long long)(d.gmem / (1024 * 1024)),
+                   (unsigned long long)(d.max_alloc / (1024 * 1024)),
+                   (i + 1 < found_devs.size()) ? "," : "");
+        }
+        const auto &best = found_devs[best_idx];
+        printf("],\"platform\":%d,\"device_index\":%d,\"device\":\"%s\",\"type\":\"%s\",\"compute_units\":%u,\"has_fp64\":%s,\"vram_bytes\":%llu,\"vram_mb\":%llu,\"max_alloc_mb\":%llu}\n",
+               best.platform_idx, best.device_idx, best.name, best.type_str, best.compute_units,
+               best.has_fp64 ? "true" : "false",
+               (unsigned long long)best.gmem,
+               (unsigned long long)(best.gmem / (1024 * 1024)),
+               (unsigned long long)(best.max_alloc / (1024 * 1024)));
         return 0;
     }
 

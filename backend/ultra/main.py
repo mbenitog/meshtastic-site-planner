@@ -603,6 +603,44 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
         logger.info("✅ [Job %s] Surface grid ready in %.2fs: %dx%d cells (%s MB)",
                     job_id, surface_dur, artifact.width, artifact.height,
                     round((artifact.width * artifact.height * 2) / (1024 * 1024), 2))
+        try:
+            import struct
+            from backend.ultra.geo import latlon_to_utm30
+            tx_x, tx_y = latlon_to_utm30(request.lat, request.lon)
+            tx_col = max(0, min(artifact.width - 1, int(round((tx_x - artifact.min_x) / artifact.resolution_m))))
+            tx_row = max(0, min(artifact.height - 1, int(round((artifact.max_y - tx_y) / artifact.resolution_m))))
+            cell_offset = tx_row * artifact.width + tx_col
+
+            surf_file = Path(artifact.path)
+            with surf_file.open("rb") as fp:
+                fp.seek(cell_offset * 2)
+                tx_base_elev = struct.unpack("<h", fp.read(2))[0]
+
+            src_desc = "unknown"
+            src_val = 0
+            src_file = Path(artifact.sources_path)
+            if src_file.exists() and src_file.stat().st_size > cell_offset:
+                with src_file.open("rb") as fp:
+                    fp.seek(cell_offset)
+                    src_val = struct.unpack("B", fp.read(1))[0]
+                source_names = {
+                    0: "Bare ground (DTM only)",
+                    1: "Building (mdsn_e025 LiDAR 2.5m)",
+                    2: "Vegetation (mdsn_v025 LiDAR 2.5m)",
+                    3: "LOD DSM (mds05 5m)",
+                }
+                src_desc = source_names.get(src_val, f"layer code {src_val}")
+
+            total_tx_asl = tx_base_elev + request.tx_height_m
+            logger.info("📍 [Job %s] TX Grid Cell: col=%d, row=%d (UTM30 X=%.1f, Y=%.1f)",
+                        job_id, tx_col, tx_row, tx_x, tx_y)
+            logger.info("📍 [Job %s] TX Altitude: base=%dm [%s] + antenna=%.1fm = %.1fm ASL",
+                        job_id, tx_base_elev, src_desc, request.tx_height_m, total_tx_asl)
+            if src_val == 0:
+                logger.warning("⚠️ [Job %s] TX landed on BARE GROUND (no building detected at this cell!). "
+                               "If you intended a rooftop, check aerial imagery parallax/tilt and place pin squarely inside building footprint.", job_id)
+        except Exception as exc:
+            logger.warning("Failed to sample TX elevation diagnostic: %s", exc)
         job["surface"] = asdict(artifact)
         job["runner_input"] = asdict(runner_input)
         job["status"] = "running_native"
@@ -1126,7 +1164,7 @@ def terrain_sample(request: TerrainSampleRequest) -> dict:
 class CoverageProbeRequest(BaseModel):
     lat: float = Field(..., ge=-90, le=90)
     lon: float = Field(..., ge=-180, le=180)
-    radius_m: float = Field(..., gt=0, le=10000)
+    radius_m: float = Field(..., gt=0, le=100000)
 
 
 @router.post("/coverage/probe")

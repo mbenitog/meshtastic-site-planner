@@ -239,26 +239,35 @@ def get_optimal_gpu_slots(
     min_profile_budget_mb = 256
 
     env_max_w_per_gpu = os.environ.get("ULTRA_MAX_WORKERS_PER_GPU")
-    max_workers_per_gpu = int(env_max_w_per_gpu) if env_max_w_per_gpu else 3
 
     dev_slots: list[list[dict]] = []
     for d in devices:
+        compute_units = d.get("compute_units", 32)
         vram_mb = d.get("vram_mb", 0)
         max_alloc_mb = d.get("max_alloc_mb", 2048)
         if vram_mb <= 0:
             continue
         vram_budget_mb = int(vram_mb * 0.80)
-        ideal_profile_budget_mb = min(max_alloc_mb, 768)
+
+        # Dynamic profile budget: scale with hardware compute units & VRAM
+        # Lower-end cards use 512-768 MB. Top-tier cards (RTX 4090 / 3090 / A100)
+        # scale up to 1500-2000 MB to keep all SMs filled with large batches.
+        ideal_profile_budget_mb = min(max_alloc_mb, max(512, int(compute_units * 12)))
         worker_footprint_mb = surf_bytes_mb + 64 + ideal_profile_budget_mb
 
-        dev_workers = min(max_workers_per_gpu, max(1, vram_budget_mb // max(1, worker_footprint_mb)))
+        # Dynamically scale workers per GPU based on VRAM and compute units:
+        # e.g., ~2.5GB VRAM per worker, and at least ~10 SMs per worker.
+        dynamic_max_workers = max(1, min(vram_mb // 2500, max(1, compute_units // 10)))
+        max_workers_for_dev = int(env_max_w_per_gpu) if env_max_w_per_gpu else min(8, dynamic_max_workers)
+
+        dev_workers = max(1, min(max_workers_for_dev, vram_budget_mb // max(1, worker_footprint_mb)))
         vram_per_worker_mb = vram_budget_mb // max(1, dev_workers)
-        profile_budget_mb = min(768, max(min_profile_budget_mb, vram_per_worker_mb - surf_bytes_mb - 64))
+        profile_budget_mb = min(ideal_profile_budget_mb, max(min_profile_budget_mb, vram_per_worker_mb - surf_bytes_mb - 64))
         if user_budget is not None:
             profile_budget_mb = user_budget
 
-        logger.info("  ↳ [GPU %d:%d] %s (%d MB VRAM) -> %d workers (~%d MB profile/w)",
-                    d["platform"], d["device"], d["name"], vram_mb, dev_workers, profile_budget_mb)
+        logger.info("  ↳ [GPU %d:%d] %s (%d MB VRAM, %d CUs) -> %d workers (~%d MB profile/w)",
+                    d["platform"], d["device"], d["name"], vram_mb, compute_units, dev_workers, profile_budget_mb)
 
         d_list = []
         for _ in range(dev_workers):

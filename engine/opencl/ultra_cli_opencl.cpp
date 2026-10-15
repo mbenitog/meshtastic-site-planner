@@ -463,11 +463,18 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Bound batch_size to at most 16,384 work items (512 warps) by default.
-       16,384 work items completely saturates all CUDA cores/SMs on modern GPUs
-       (Ampere/Turing/Ada) while keeping profile buffers to ~300-400 MB per worker
-       instead of multiple gigabytes. */
-    int max_batch_limit = 16384;
+    /* Compute hardware saturation target based on device compute units (SMs).
+       1,024 work items per SM (32 warps/SM) achieves peak hardware saturation
+       and latency hiding for Longley-Rice under register pressure.
+       High-end GPUs (e.g. RTX 4090 with 128 SMs) scale up to 131k work items,
+       while smaller GPUs (RTX 3060 with 28 SMs) scale down to ~28k items,
+       automatically fitting their hardware profile and VRAM budget. */
+    cl_uint compute_units = 1;
+    clGetDeviceInfo(pick.device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, NULL);
+    if (compute_units < 1) compute_units = 1;
+
+    int cu_saturation_batch = (int)compute_units * 1024;
+    int max_batch_limit = std::max(16384, cu_saturation_batch);
     const char *env_max_batch = getenv("ULTRA_MAX_BATCH_SIZE");
     if (env_max_batch) {
         int mb = atoi(env_max_batch);

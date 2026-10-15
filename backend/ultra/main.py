@@ -340,13 +340,15 @@ def _run_surface_subprocess(
     registry = _ensure_pids_registry()
     job_pid_list = registry.setdefault(job_id, _active_pids_manager.list())
     job_pid_list.append(proc.pid)
+    radius_km = float(request.get("radius_km", 10.0))
+    timeout_s = max(600, min(1800, int(radius_km * 60)))
     try:
         try:
-            stdout, stderr = proc.communicate(timeout=300)
+            stdout, stderr = proc.communicate(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout, stderr = proc.communicate()
-            return None, None, f"surface build timed out after 300s"
+            return None, None, f"surface build timed out after {timeout_s}s"
 
         if proc.returncode != 0:
             # If cancel was requested, the SIGTERM was what killed us; return

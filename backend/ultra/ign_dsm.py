@@ -19,7 +19,7 @@ import numpy as np
 logger = logging.getLogger("uvicorn.error")
 
 WCS_URL = "https://wcs-mds.idee.es/mds"
-DEFAULT_DOWNLOAD_CONCURRENCY = int(os.environ.get("IGN_DOWNLOAD_CONCURRENCY", "8"))
+DEFAULT_DOWNLOAD_CONCURRENCY = int(os.environ.get("IGN_DOWNLOAD_CONCURRENCY", "16"))
 
 
 @dataclass(frozen=True)
@@ -122,7 +122,7 @@ class IgnDsmClient:
         min_y: float,
         max_x: float,
         max_y: float,
-        timeout: float = 120.0,
+        timeout: float = 35.0,
     ) -> ArcGrid:
         params = {
             "service": "WCS",
@@ -169,7 +169,7 @@ class IgnDsmClient:
         max_x: float,
         max_y: float,
         max_cells_per_request: int = 1_100_000,
-        timeout: float = 120.0,
+        timeout: float = 35.0,
     ) -> ArcGrid:
         """Fetch a potentially large bbox by splitting it into several WCS
         sub-requests and stitching the resulting ArcGrids into a single grid.
@@ -229,13 +229,17 @@ class IgnDsmClient:
                 for (bx0, by0, bx1, by1) in sub_boxes
             ]
             completed_tiles = 0
+            total_sub = len(sub_boxes)
             for fut in concurrent.futures.as_completed(futures):
                 try:
                     res = fut.result()
                     tiles.append(res)
-                    completed_tiles += 1
                 except Exception:
                     pass  # sub-tile outside coverage; treat as no-data
+                completed_tiles += 1
+                if completed_tiles % 10 == 0 or completed_tiles == total_sub:
+                    logger.info("  ↳ [IGN WCS] '%s' progress: %d/%d sub-tiles fetched (%.0f%%)",
+                                coverage_id, completed_tiles, total_sub, (completed_tiles / total_sub) * 100)
         logger.info("  📦 [IGN WCS] '%s' download complete: %d/%d tiles received, stitching...",
                     coverage_id, len(tiles), len(sub_boxes))
 

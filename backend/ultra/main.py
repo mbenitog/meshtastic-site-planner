@@ -236,36 +236,51 @@ def get_optimal_gpu_slots(
     user_budget = int(env_budget) if env_budget else None
 
     slots: list[dict] = []
-    min_profile_budget_mb = 384
+    min_profile_budget_mb = 256
 
+    env_max_w_per_gpu = os.environ.get("ULTRA_MAX_WORKERS_PER_GPU")
+    max_workers_per_gpu = int(env_max_w_per_gpu) if env_max_w_per_gpu else 3
+
+    dev_slots: list[list[dict]] = []
     for d in devices:
         vram_mb = d.get("vram_mb", 0)
         max_alloc_mb = d.get("max_alloc_mb", 2048)
         if vram_mb <= 0:
             continue
-        vram_budget_mb = int(vram_mb * 0.85)
-        ideal_profile_budget_mb = min(max_alloc_mb, 1600)
+        vram_budget_mb = int(vram_mb * 0.80)
+        ideal_profile_budget_mb = min(max_alloc_mb, 768)
         worker_footprint_mb = surf_bytes_mb + 64 + ideal_profile_budget_mb
 
-        dev_workers = max(1, vram_budget_mb // max(1, worker_footprint_mb))
+        dev_workers = min(max_workers_per_gpu, max(1, vram_budget_mb // max(1, worker_footprint_mb)))
         vram_per_worker_mb = vram_budget_mb // max(1, dev_workers)
-        profile_budget_mb = max(min_profile_budget_mb, vram_per_worker_mb - surf_bytes_mb - 64)
+        profile_budget_mb = min(768, max(min_profile_budget_mb, vram_per_worker_mb - surf_bytes_mb - 64))
         if user_budget is not None:
             profile_budget_mb = user_budget
 
         logger.info("  ↳ [GPU %d:%d] %s (%d MB VRAM) -> %d workers (~%d MB profile/w)",
                     d["platform"], d["device"], d["name"], vram_mb, dev_workers, profile_budget_mb)
 
+        d_list = []
         for _ in range(dev_workers):
-            slots.append({
+            d_list.append({
                 "platform": d["platform"],
                 "device": d["device"],
                 "budget_mb": profile_budget_mb,
                 "name": d["name"],
             })
+        dev_slots.append(d_list)
 
-    if not slots:
+    if not dev_slots:
         return []
+
+    # Interleave slots across devices: round-robin [GPU0, GPU1, GPU0, GPU1, ...]
+    interleaved_slots: list[dict] = []
+    max_count = max(len(s) for s in dev_slots)
+    for i in range(max_count):
+        for s in dev_slots:
+            if i < len(s):
+                interleaved_slots.append(s[i])
+    slots = interleaved_slots
 
     if forced_total_workers is not None:
         target_count = min(max(1, forced_total_workers), max(1, total_tiles))

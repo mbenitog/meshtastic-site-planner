@@ -20,7 +20,7 @@ logger = logging.getLogger("uvicorn.error")
 
 API_COVERAGES_URL = "https://api-coverages.idee.es/collections"
 DTM_5M_25830 = "EL.ElevationGridCoverage_25830_5_PB"
-DEFAULT_DOWNLOAD_CONCURRENCY = int(os.environ.get("IGN_DOWNLOAD_CONCURRENCY", "8"))
+DEFAULT_DOWNLOAD_CONCURRENCY = int(os.environ.get("IGN_DOWNLOAD_CONCURRENCY", "16"))
 
 
 @dataclass
@@ -200,7 +200,7 @@ class CoverageApiClient:
         max_x: float,
         max_y: float,
         max_cells_per_request: int = 250_000,
-        timeout: float = 120.0,
+        timeout: float = 35.0,
     ) -> CoverageGrid:
         """Fetch a bbox by splitting it into several sub-requests. The DTM
         coverage at 5 m cells typically allows ~225 cells per side, so
@@ -248,8 +248,14 @@ class CoverageApiClient:
                 )
                 for (bx0, by0, bx1, by1) in sub_boxes
             ]
+            completed = 0
+            total_sub = len(sub_boxes)
             for fut in concurrent.futures.as_completed(futures):
                 tiles.append(fut.result())
+                completed += 1
+                if completed % 10 == 0 or completed == total_sub:
+                    logger.info("  ↳ [IGN DTM] '%s' progress: %d/%d sub-tiles fetched (%.0f%%)",
+                                collection_id, completed, total_sub, (completed / total_sub) * 100)
         logger.info("  📦 [IGN DTM] '%s' download complete: %d/%d tiles received, stitching...",
                     collection_id, len(tiles), len(sub_boxes))
 

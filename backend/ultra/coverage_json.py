@@ -212,20 +212,17 @@ class CoverageApiClient:
             return grid
 
         url = f"{API_COVERAGES_URL}/{collection_id}/coverage?{urlencode(params, safe=',')}"
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
         last_error = None
         for attempt in range(3):
             try:
-                try:
-                    with urlopen(req, timeout=timeout) as response:
-                        text = response.read().decode("utf-8")
-                except URLError:
-                    result = subprocess.run(
-                        ["curl", "-L", "-A", "Mozilla/5.0", "--max-time", str(int(timeout)), url],
-                        check=True,
-                        capture_output=True,
-                    )
-                    text = result.stdout.decode("utf-8")
+                result = subprocess.run(
+                    ["curl", "-s", "-L", "-A", "Mozilla/5.0", "--max-time", str(int(timeout)), url],
+                    check=True,
+                    capture_output=True,
+                )
+                text = result.stdout.decode("utf-8")
+                if not text or not text.strip().startswith("{"):
+                    raise ValueError(f"Invalid response from IGN Coverage API: {text[:200]}")
                 cache_path.write_text(text, encoding="utf-8")
                 grid = parse_coverage_json(text, fill_on_init=fill_on_init)
                 try:

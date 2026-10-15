@@ -36,9 +36,20 @@ def main() -> int:
     out_dir = Path(payload["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    import logging
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        stream=sys.stdout,
+        force=True,
+    )
+    logging.getLogger("uvicorn.error").setLevel(logging.INFO)
     error_file = out_dir / "surface_error.txt"
     done_file = out_dir / "surface_done.flag"
-    # Clear any stale markers from a previous (cancelled) run.
     for stale in (error_file, done_file):
         if stale.exists():
             stale.unlink()

@@ -329,7 +329,7 @@ def _run_surface_subprocess(
         encoding="utf-8",
     )
 
-    cmd = [_sys.executable, "-m", "backend.ultra.surface_worker", str(payload_file)]
+    cmd = [_sys.executable, "-u", "-m", "backend.ultra.surface_worker", str(payload_file)]
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -341,13 +341,60 @@ def _run_surface_subprocess(
     job_pid_list = registry.setdefault(job_id, _active_pids_manager.list())
     job_pid_list.append(proc.pid)
     radius_km = float(request.get("radius_km", 10.0))
-    timeout_s = max(600, min(1800, int(radius_km * 60)))
-    try:
+    # Area scales quadratically with radius: (R/10)^2. Cold downloads from public IGN servers require proportional time.
+    env_timeout = os.environ.get("ULTRA_SURFACE_TIMEOUT_S")
+    if env_timeout:
+        timeout_s = int(env_timeout)
+    else:
+        timeout_s = max(900, int(600 + 450 * (radius_km / 10.0) ** 2))
+    logger.info("   ↳ [Job %s] Phase 1 timeout budget: %ds (%.1f min) for %.1fkm radius",
+                job_id, timeout_s, timeout_s / 60.0, radius_km)
+
+    collected_stdout: list[str] = []
+    collected_stderr: list[str] = []
+
+    def _stream_reader(stream, storage_list, is_err=False):
         try:
-            stdout, stderr = proc.communicate(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
+            for line in iter(stream.readline, ""):
+                storage_list.append(line)
+                stripped = line.strip()
+                if stripped:
+                    if is_err and "error" in stripped.lower():
+                        logger.warning("   ↳ [Job %s] [Worker] %s", job_id, stripped)
+                    else:
+                        logger.info("   ↳ [Job %s] %s", job_id, stripped)
+        except Exception:
+            pass
+        finally:
+            stream.close()
+
+    import threading
+    t_stdout = threading.Thread(target=_stream_reader, args=(proc.stdout, collected_stdout, False), daemon=True)
+    t_stderr = threading.Thread(target=_stream_reader, args=(proc.stderr, collected_stderr, True), daemon=True)
+    t_stdout.start()
+    t_stderr.start()
+
+    try:
+        start_time = time.time()
+        timed_out = False
+        while True:
+            ret = proc.poll()
+            if ret is not None:
+                break
+            if time.time() - start_time > timeout_s:
+                timed_out = True
+                proc.kill()
+                proc.wait()
+                break
+            time.sleep(0.5)
+
+        t_stdout.join(timeout=2.0)
+        t_stderr.join(timeout=2.0)
+
+        stdout = "".join(collected_stdout)
+        stderr = "".join(collected_stderr)
+
+        if timed_out:
             return None, None, f"surface build timed out after {timeout_s}s"
 
         if proc.returncode != 0:

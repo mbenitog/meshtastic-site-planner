@@ -462,6 +462,21 @@ int main(int argc, char **argv) {
             batch_size = max_prof_items;
         }
     }
+
+    /* Bound batch_size to at most 16,384 work items (512 warps) by default.
+       16,384 work items completely saturates all CUDA cores/SMs on modern GPUs
+       (Ampere/Turing/Ada) while keeping profile buffers to ~300-400 MB per worker
+       instead of multiple gigabytes. */
+    int max_batch_limit = 16384;
+    const char *env_max_batch = getenv("ULTRA_MAX_BATCH_SIZE");
+    if (env_max_batch) {
+        int mb = atoi(env_max_batch);
+        if (mb >= 1024) max_batch_limit = mb;
+    }
+    if (batch_size > max_batch_limit) {
+        batch_size = max_batch_limit;
+    }
+
     batch_size = std::min(batch_size, total_cells);
     /* round down to multiple of local */
     batch_size = (int)(((size_t)batch_size / local) * local);
@@ -481,27 +496,58 @@ int main(int argc, char **argv) {
     cl_mem d_surf = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                    surf_cells * sizeof(int16_t), surface.data(), &e);
     CL_CHECK(e);
-    cl_mem d_prof = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
-                                   alloc_batch * stride_prof * elem_size, NULL, &e);
-    CL_CHECK(e);
-    cl_mem d_scratch = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
-                                      alloc_batch * D1THX_SCRATCH_LEN * elem_size, NULL, &e);
-    CL_CHECK(e);
     cl_mem d_signal = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
                                      (size_t)total_cells * sizeof(int16_t), NULL, &e);
     CL_CHECK(e);
     cl_mem d_mask = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
                                    (size_t)total_cells * sizeof(uint8_t), NULL, &e);
     CL_CHECK(e);
-    /* dbloss + errnum buffers for itm_p2p_kernel */
-    cl_mem d_loss = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
-                                   alloc_batch * elem_size, NULL, &e);
-    CL_CHECK(e);
-    cl_mem d_err = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
-                                  alloc_batch * sizeof(int), NULL, &e);
-    CL_CHECK(e);
-    CL_CHECK(clSetKernelArg(kern_itm, 13, sizeof(cl_mem), &d_loss));
-    CL_CHECK(clSetKernelArg(kern_itm, 14, sizeof(cl_mem), &d_err));
+
+    cl_mem d_prof = NULL;
+    cl_mem d_scratch = NULL;
+    cl_mem d_loss = NULL;
+    cl_mem d_err = NULL;
+
+    auto free_batch_buffers = [&]() {
+        if (d_prof) { clReleaseMemObject(d_prof); d_prof = NULL; }
+        if (d_scratch) { clReleaseMemObject(d_scratch); d_scratch = NULL; }
+        if (d_loss) { clReleaseMemObject(d_loss); d_loss = NULL; }
+        if (d_err) { clReleaseMemObject(d_err); d_err = NULL; }
+    };
+
+    auto alloc_batch_buffers = [&](size_t abatch) -> bool {
+        free_batch_buffers();
+        cl_int err = CL_SUCCESS;
+        d_prof = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
+                                abatch * stride_prof * elem_size, NULL, &err);
+        if (err != CL_SUCCESS) { free_batch_buffers(); return false; }
+        d_scratch = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
+                                  abatch * D1THX_SCRATCH_LEN * elem_size, NULL, &err);
+        if (err != CL_SUCCESS) { free_batch_buffers(); return false; }
+        d_loss = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
+                                abatch * elem_size, NULL, &err);
+        if (err != CL_SUCCESS) { free_batch_buffers(); return false; }
+        d_err = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
+                              abatch * sizeof(int), NULL, &err);
+        if (err != CL_SUCCESS) { free_batch_buffers(); return false; }
+
+        clSetKernelArg(kern_build, 13, sizeof(cl_mem), &d_prof);
+        clSetKernelArg(kern_itm, 0, sizeof(cl_mem), &d_prof);
+        clSetKernelArg(kern_itm, 2, sizeof(cl_mem), &d_scratch);
+        clSetKernelArg(kern_itm, 13, sizeof(cl_mem), &d_loss);
+        clSetKernelArg(kern_itm, 14, sizeof(cl_mem), &d_err);
+        return true;
+    };
+
+    while (!alloc_batch_buffers(alloc_batch) && batch_size > (int)local) {
+        batch_size = (int)(((size_t)(batch_size / 2) / local) * local);
+        if (batch_size < (int)local) batch_size = (int)local;
+        alloc_batch = ((size_t)batch_size + local - 1) / local * local;
+    }
+    if (!d_prof) {
+        fprintf(stderr, "failed to allocate OpenCL batch buffers on %s\n", pick.name);
+        return 1;
+    }
 
     /* ---- set static args for build_profiles_kernel ---- */
     /* 0: surface, 1: surf_w, 2: surf_h, 3: tx_col, 4: tx_row, 5: resolution,
@@ -552,7 +598,7 @@ int main(int argc, char **argv) {
     std::vector<double> loss_buf(alloc_batch);
     std::vector<int> err_buf(alloc_batch);
 
-    for (int batch_start = 0; batch_start < total_cells; batch_start += batch_size) {
+    for (int batch_start = 0; batch_start < total_cells; ) {
         int batch_count = std::min(batch_size, total_cells - batch_start);
 
         if (cpu_profiles) {
@@ -595,7 +641,19 @@ int main(int argc, char **argv) {
             CL_CHECK(clSetKernelArg(kern_build, 12, sizeof(int), &total_cells));
             size_t global0 = (size_t)batch_count;
             global0 = ((global0 + local - 1) / local) * local;
-            CL_CHECK(clEnqueueNDRangeKernel(q, kern_build, 1, NULL, &global0, &local, 0, NULL, NULL));
+            cl_int kerr = clEnqueueNDRangeKernel(q, kern_build, 1, NULL, &global0, &local, 0, NULL, NULL);
+            if ((kerr == CL_MEM_OBJECT_ALLOCATION_FAILURE || kerr == CL_OUT_OF_RESOURCES) && batch_size > (int)local) {
+                fprintf(stderr, "warning: VRAM pressure on %s, halving batch %d -> %d\n",
+                        pick.name, batch_size, batch_size / 2);
+                batch_size = (int)(((size_t)(batch_size / 2) / local) * local);
+                if (batch_size < (int)local) batch_size = (int)local;
+                alloc_batch = ((size_t)batch_size + local - 1) / local * local;
+                alloc_batch_buffers(alloc_batch);
+                loss_buf.resize(alloc_batch);
+                err_buf.resize(alloc_batch);
+                continue;
+            }
+            CL_CHECK(kerr);
             CL_CHECK(clFinish(q));
         }
 
@@ -632,6 +690,7 @@ int main(int argc, char **argv) {
                 batch_start / batch_size + 1,
                 (total_cells + batch_size - 1) / batch_size,
                 batch_count);
+        batch_start += batch_count;
     }
     fprintf(stderr, "\n");
 

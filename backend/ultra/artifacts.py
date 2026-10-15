@@ -54,7 +54,8 @@ def write_surface_artifact(grid: SurfaceGrid, out_dir: str | Path) -> SurfaceArt
     meta_path = out / "surface_meta.json"
 
     values_arr = np.asarray(grid.values, dtype=np.float32).reshape(-1)
-    values_i16 = np.clip(np.round(values_arr), -32768, 32767).astype("<i2")
+    clean_vals = np.nan_to_num(values_arr, nan=-32768.0)
+    values_i16 = np.clip(np.round(clean_vals), -32768, 32767).astype("<i2")
     surface_path.write_bytes(values_i16.tobytes())
 
     sources_arr = np.asarray(grid.sources, dtype=np.uint8).reshape(-1) if hasattr(grid.sources, "__len__") and len(grid.sources) > 0 else np.zeros(0, dtype=np.uint8)

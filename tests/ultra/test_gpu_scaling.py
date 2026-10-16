@@ -106,3 +106,29 @@ def test_create_ultra_job_adopts_surface_from_prior_job(tmp_path: Path):
         assert (new_dir / "surface_i16le.bin").exists()
         assert (new_dir / "surface_meta.json").exists()
         assert (new_dir / "coverage_x0_y0.signal_i16le.bin").exists()
+
+
+def test_resolve_native_binary_falls_back_to_cpu_when_no_opencl_platforms(tmp_path: Path):
+    import sys
+    mod = sys.modules.get("backend.ultra.main", ultra_main)
+
+    cpu_bin = tmp_path / "ultra_cli"
+    cpu_bin.write_text("#!/bin/sh\nexit 0\n")
+    cpu_bin.chmod(0o755)
+
+    opencl_bin = tmp_path / "ultra_cli_opencl"
+    opencl_bin.write_text("#!/bin/sh\nexit 1\n")
+    opencl_bin.chmod(0o755)
+
+    kernel = tmp_path / "itm_kernel.cl"
+    kernel.write_text("// kernel\n")
+
+    with patch.dict("os.environ", {
+        "ULTRA_CLI": str(opencl_bin),
+        "ULTRA_OPENCL_KERNEL": str(kernel),
+    }), patch.object(mod, "_probe_gpu", return_value=None):
+        bin_path, resolved_kernel = mod._resolve_native_binary()
+        # When OpenCL has no platforms (probe fails/returns None), it must fallback to CPU
+        assert bin_path.name == "ultra_cli"
+        assert resolved_kernel == ""
+

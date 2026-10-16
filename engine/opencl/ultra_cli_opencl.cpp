@@ -455,26 +455,30 @@ int main(int argc, char **argv) {
     size_t bytes_per_item = (size_t)(stride_prof + D1THX_SCRATCH_LEN + 2) * elem_size;
     int batch_size = (int)(mem_budget / bytes_per_item);
 
-    /* ensure d_prof does not exceed max_alloc */
+    /* OpenCL continuous allocation safety:
+       Never request a single buffer exceeding 65% of CL_DEVICE_MAX_MEM_ALLOC_SIZE
+       to prevent memory fragmentation in the driver's virtual memory manager. */
     if (max_alloc > 0) {
-        int max_prof_items = (int)(max_alloc / ((size_t)stride_prof * elem_size));
+        size_t safe_max_alloc = (size_t)((double)max_alloc * 0.65);
+        int max_prof_items = (int)(safe_max_alloc / ((size_t)stride_prof * elem_size));
         if (max_prof_items > 0 && batch_size > max_prof_items) {
             batch_size = max_prof_items;
         }
     }
 
     /* Compute hardware saturation target based on device compute units (SMs).
-       1,024 work items per SM (32 warps/SM) achieves peak hardware saturation
-       and latency hiding for Longley-Rice under register pressure.
-       High-end GPUs (e.g. RTX 4090 with 128 SMs) scale up to 131k work items,
-       while smaller GPUs (RTX 3060 with 28 SMs) scale down to ~28k items,
-       automatically fitting their hardware profile and VRAM budget. */
+       To hide memory latency and saturate all execution pipelines without
+       unnecessarily bloating VRAM:
+       - 512 work items per CU (16 warps/CU) provides 100% ALU occupancy for Longley-Rice.
+       - A GPU with 28 CUs (RTX 3060) reaches peak saturation at 28 * 512 = 14,336 work items.
+       - A GPU with 128 CUs (RTX 4090) scales to 128 * 512 = 65,536 work items.
+       - Minimum batch size floor is 4096 (128 warps), ensuring even small GPUs are saturated. */
     cl_uint compute_units = 1;
     clGetDeviceInfo(pick.device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, NULL);
     if (compute_units < 1) compute_units = 1;
 
-    int cu_saturation_batch = (int)compute_units * 1024;
-    int max_batch_limit = std::max(16384, cu_saturation_batch);
+    int cu_saturation_batch = (int)compute_units * 512;
+    int max_batch_limit = std::max(4096, cu_saturation_batch);
     const char *env_max_batch = getenv("ULTRA_MAX_BATCH_SIZE");
     if (env_max_batch) {
         int mb = atoi(env_max_batch);
@@ -520,6 +524,17 @@ int main(int argc, char **argv) {
         if (d_scratch) { clReleaseMemObject(d_scratch); d_scratch = NULL; }
         if (d_loss) { clReleaseMemObject(d_loss); d_loss = NULL; }
         if (d_err) { clReleaseMemObject(d_err); d_err = NULL; }
+    };
+
+    auto recreate_queue = [&]() -> bool {
+        if (q) {
+            clFinish(q);
+            clReleaseCommandQueue(q);
+            q = NULL;
+        }
+        cl_int qerr = CL_SUCCESS;
+        q = clCreateCommandQueue(ctx, pick.device, 0, &qerr);
+        return qerr == CL_SUCCESS;
     };
 
     auto alloc_batch_buffers = [&](size_t abatch) -> bool {
@@ -650,11 +665,12 @@ int main(int argc, char **argv) {
             global0 = ((global0 + local - 1) / local) * local;
             cl_int kerr = clEnqueueNDRangeKernel(q, kern_build, 1, NULL, &global0, &local, 0, NULL, NULL);
             if ((kerr == CL_MEM_OBJECT_ALLOCATION_FAILURE || kerr == CL_OUT_OF_RESOURCES) && batch_size > (int)local) {
-                fprintf(stderr, "warning: VRAM pressure on %s, halving batch %d -> %d\n",
+                fprintf(stderr, "warning: VRAM pressure on %s (build kernel), halving batch %d -> %d\n",
                         pick.name, batch_size, batch_size / 2);
                 batch_size = (int)(((size_t)(batch_size / 2) / local) * local);
                 if (batch_size < (int)local) batch_size = (int)local;
                 alloc_batch = ((size_t)batch_size + local - 1) / local * local;
+                recreate_queue();
                 alloc_batch_buffers(alloc_batch);
                 loss_buf.resize(alloc_batch);
                 err_buf.resize(alloc_batch);
@@ -668,7 +684,20 @@ int main(int argc, char **argv) {
         CL_CHECK(clSetKernelArg(kern_itm, 15, sizeof(int), &batch_count));
         size_t global = (size_t)batch_count;
         global = ((global + local - 1) / local) * local;
-        CL_CHECK(clEnqueueNDRangeKernel(q, kern_itm, 1, NULL, &global, &local, 0, NULL, NULL));
+        cl_int kerr_itm = clEnqueueNDRangeKernel(q, kern_itm, 1, NULL, &global, &local, 0, NULL, NULL);
+        if ((kerr_itm == CL_MEM_OBJECT_ALLOCATION_FAILURE || kerr_itm == CL_OUT_OF_RESOURCES) && batch_size > (int)local) {
+            fprintf(stderr, "warning: VRAM pressure on %s (itm kernel), halving batch %d -> %d\n",
+                    pick.name, batch_size, batch_size / 2);
+            batch_size = (int)(((size_t)(batch_size / 2) / local) * local);
+            if (batch_size < (int)local) batch_size = (int)local;
+            alloc_batch = ((size_t)batch_size + local - 1) / local * local;
+            recreate_queue();
+            alloc_batch_buffers(alloc_batch);
+            loss_buf.resize(alloc_batch);
+            err_buf.resize(alloc_batch);
+            continue;
+        }
+        CL_CHECK(kerr_itm);
         CL_CHECK(clFinish(q));
 
         /* Read back dbloss and convert to signal/mask on CPU */

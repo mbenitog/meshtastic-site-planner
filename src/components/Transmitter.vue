@@ -54,6 +54,16 @@
             </button>
           </div>
         </div>
+        <div v-else-if="store.elevationProbe && !store.elevationProbe.available" class="p-2 rounded bg-slate-800/80 border border-slate-700/60 text-xs flex items-center justify-between gap-2 text-slate-400">
+          <span>{{ store.elevationProbe.error || 'Cota no disponible o fuera de cobertura IGN' }}</span>
+          <button
+            type="button"
+            @click="store.fetchElevationProbe(Number(transmitter.tx_lat), Number(transmitter.tx_lon))"
+            class="mt-btn mt-btn-sm py-0.5 px-2 text-[10px] whitespace-nowrap"
+          >
+            Reintentar
+          </button>
+        </div>
       </div>
       <div class="col-span-2">
         <label for="device" class="mt-label">Device (optional)</label>
@@ -179,5 +189,10 @@ watch(
 
 onMounted(() => {
   store.initMap(); // Initialize the map
+  const lat = Number(transmitter.tx_lat);
+  const lon = Number(transmitter.tx_lon);
+  if (Number.isFinite(lat) && Number.isFinite(lon)) {
+    store.fetchElevationProbe(lat, lon);
+  }
 });
 </script>

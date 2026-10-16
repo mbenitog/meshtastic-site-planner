@@ -27,10 +27,10 @@ const PIN_SVG = `
 </svg>`;
 
 /** Marker element for a simulated site. */
-export function sitePinElement(): HTMLElement {
+export function sitePinElement(elevText?: string): HTMLElement {
   const el = document.createElement('div');
-  el.className = 'mt-pin';
-  el.innerHTML = PIN_SVG;
+  el.className = 'mt-pin mt-pin-site';
+  el.innerHTML = PIN_SVG + (elevText ? `<div class="mt-pin-tooltip mt-pin-tooltip-ground" style="display:block">${elevText}</div>` : '');
   return el;
 }
 

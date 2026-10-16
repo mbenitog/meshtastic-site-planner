@@ -38,6 +38,7 @@ let map: maplibregl.Map | undefined;
 let currentMarker: maplibregl.Marker | undefined;
 let probeAbort: AbortController | undefined;
 let probeTimer: ReturnType<typeof setTimeout> | undefined;
+let lastProbedCoords: { lat: number; lon: number } | null = null;
 const siteMarkers = new Map<string, maplibregl.Marker>();
 // Active only while "place on map" is armed.
 let placeEscHandler: ((e: KeyboardEvent) => void) | undefined;
@@ -323,6 +324,22 @@ const useStore = defineStore('store', {
       }
     },
     async fetchElevationProbe(lat: number, lon: number) {
+      if (probeTimer) {
+        clearTimeout(probeTimer);
+        probeTimer = undefined;
+      }
+      if (
+        lastProbedCoords &&
+        Math.abs(lastProbedCoords.lat - lat) < 1e-6 &&
+        Math.abs(lastProbedCoords.lon - lon) < 1e-6 &&
+        this.elevationProbe &&
+        this.elevationProbe.available
+      ) {
+        this.elevationProbeLoading = false;
+        this.updateMarkerTooltip();
+        return;
+      }
+
       if (probeAbort) {
         probeAbort.abort();
         probeAbort = undefined;
@@ -331,14 +348,29 @@ const useStore = defineStore('store', {
       probeAbort = ac;
       this.elevationProbeLoading = true;
       this.updateMarkerTooltip();
+
       try {
         const baseUrl = this.splatParams.simulation.ultra_backend_url || defaultUltraBackendUrl();
-        const res = await probeUltraElevation(baseUrl, lat, lon, ac.signal);
+        let res: UltraElevationProbe;
+        try {
+          res = await probeUltraElevation(baseUrl, lat, lon, ac.signal);
+        } catch (err: any) {
+          if (ac.signal.aborted) return;
+          console.warn('[Elevation probe] Dedicated route failed, falling back to /coverage/probe:', err?.message);
+          const covProbe = await probeUltraCoverage(baseUrl, lat, lon, 250, ac.signal);
+          if (covProbe.elevation) {
+            res = covProbe.elevation;
+          } else {
+            throw err;
+          }
+        }
         if (ac.signal.aborted) return;
         this.elevationProbe = res;
-      } catch {
+        lastProbedCoords = { lat, lon };
+      } catch (err: any) {
         if (ac.signal.aborted) return;
-        this.elevationProbe = null;
+        console.warn('[Elevation probe failed]:', err);
+        this.elevationProbe = { available: false, lat, lon, error: err?.message || 'Error al consultar cota' };
       } finally {
         if (!ac.signal.aborted) {
           this.elevationProbeLoading = false;
@@ -352,7 +384,7 @@ const useStore = defineStore('store', {
       this.updateMarkerTooltip();
       probeTimer = setTimeout(() => {
         this.fetchElevationProbe(lat, lon);
-      }, 180);
+      }, 250);
     },
     /** Place or move the draggable draft transmitter marker. */
     setDraftMarker(lat: number, lon: number) {
@@ -369,16 +401,21 @@ const useStore = defineStore('store', {
       })
         .setLngLat([lon, lat])
         .addTo(map);
-      // Dragging the pin updates the probe live.
+      // Visual feedback while dragging; probe only fires on dragend
+      currentMarker.on('dragstart', () => {
+        this.elevationProbeLoading = true;
+        this.updateMarkerTooltip();
+      });
       currentMarker.on('drag', () => {
-        const ll = currentMarker!.getLngLat();
-        const lng = wrapLon(ll.lng);
-        this.fetchElevationProbeDebounced(Number(ll.lat.toFixed(6)), Number(lng.toFixed(6)));
+        this.elevationProbeLoading = true;
+        this.updateMarkerTooltip();
       });
       currentMarker.on('dragend', () => {
         const ll = currentMarker!.getLngLat();
         const lng = wrapLon(ll.lng);
-        this.setTxCoords(Number(ll.lat.toFixed(6)), Number(lng.toFixed(6)));
+        const newLat = Number(ll.lat.toFixed(6));
+        const newLon = Number(lng.toFixed(6));
+        this.setTxCoords(newLat, newLon);
       });
       this.updateMarkerTooltip();
     },
@@ -976,6 +1013,8 @@ const useStore = defineStore('store', {
       const site = this.localSites[index];
       if (!site || !map) return;
       const { tx_lat, tx_lon } = site.params.transmitter;
+      this.setTxCoords(tx_lat, tx_lon);
+      this.setDraftMarker(tx_lat, tx_lon);
       map.flyTo({ center: [tx_lon, tx_lat], zoom: Math.max(map.getZoom(), 9) });
       const marker = siteMarkers.get(site.id);
       if (marker && !marker.getPopup()?.isOpen()) marker.togglePopup();
@@ -1081,9 +1120,14 @@ const useStore = defineStore('store', {
         this.cancelPlaceOnMap();
         this.clearDraftMarker();
         if (map) {
+          const elevText = this.elevationProbe?.available
+            ? ((this.elevationProbe.structure_m ?? 0) > 0.5
+                ? `🏢 ${this.elevationProbe.surface_m}m`
+                : `📍 ${this.elevationProbe.surface_m}m`)
+            : undefined;
           const popup = new maplibregl.Popup({ closeButton: true, offset: 46 })
             .setDOMContent(buildSitePopup(site));
-          const marker = new maplibregl.Marker({ element: sitePinElement(), anchor: 'bottom' })
+          const marker = new maplibregl.Marker({ element: sitePinElement(elevText), anchor: 'bottom' })
             .setLngLat([request.lon, request.lat])
             .setPopup(popup)
             .addTo(map);

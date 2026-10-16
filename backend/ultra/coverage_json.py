@@ -67,8 +67,10 @@ class CoverageGrid:
             shifted[mask] = filled[:, 1:][mask]
             filled[:, :-1] = shifted
             valid[:, :-1] |= valid[:, 1:]
+            # Ensure open sea / remaining missing data defaults to sea level (0.0 m ASL)
+            filled = np.nan_to_num(filled, nan=0.0)
         else:
-            filled = arr
+            filled = np.nan_to_num(arr, nan=0.0)
         self._values_arr = arr
         self._valid = valid
         self._filled = filled
@@ -85,13 +87,15 @@ class CoverageGrid:
     def min_value(self) -> float:
         if not bool(self._valid.any()):
             return 0.0
-        return float(np.nanmin(self._values_arr))
+        val = float(np.nanmin(self._values_arr))
+        return 0.0 if (math.isnan(val) or math.isinf(val)) else val
 
     @property
     def max_value(self) -> float:
         if not bool(self._valid.any()):
             return 0.0
-        return float(np.nanmax(self._values_arr))
+        val = float(np.nanmax(self._values_arr))
+        return 0.0 if (math.isnan(val) or math.isinf(val)) else val
 
     def _col(self, x: float) -> int:
         if self.width == 1:

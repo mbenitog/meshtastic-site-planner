@@ -26,7 +26,7 @@ import {
 } from './permalink.ts';
 import { coverageStats } from './coverageStats.ts';
 import { TerrainService } from './terrain/TerrainService.ts';
-import { cancelUltraJob, runUltraBackend, probeUltraCoverage, probeUltraElevation, type UltraSurfaceMode, type UltraElevationProbe } from './ultraBackend.ts';
+import { cancelUltraJob, runUltraBackend, loadUltraJobResult, probeUltraCoverage, probeUltraElevation, type UltraSurfaceMode, type UltraElevationProbe } from './ultraBackend.ts';
 import type { UltraBackendResult } from './ultraBackend.ts';
 
 // Module-level singletons: workers, terrain cache, and map handles outlive
@@ -283,6 +283,7 @@ const useStore = defineStore('store', {
       measureMode: false,
       measureResult: null as { distanceKm: number; bearingDeg: number } | null,
       currentUltraJobId: '' as string,
+      lastUltraJobId: '' as string,
       /** Real-time elevation probe for the current transmitter position (#Option B). */
       elevationProbe: null as UltraElevationProbe | null,
       elevationProbeLoading: false,
@@ -1078,6 +1079,7 @@ const useStore = defineStore('store', {
                 surfaceMode,
                 onJobCreated: (jobId) => {
                   this.currentUltraJobId = jobId;
+                  this.lastUltraJobId = jobId;
                 },
               });
             })()
@@ -1154,6 +1156,68 @@ const useStore = defineStore('store', {
         this.currentUltraJobId = '';
         this.progress = null;
         abortController = undefined;
+      }
+    },
+    async loadExistingUltraJob(jobId?: string): Promise<void> {
+      const idToLoad = jobId || this.lastUltraJobId || this.currentUltraJobId;
+      if (!idToLoad) {
+        this.errorMessage = 'No Ultra job ID available to load';
+        this.simulationState = 'failed';
+        return;
+      }
+      const baseUrl = this.splatParams.simulation.ultra_backend_url || defaultUltraBackendUrl();
+      this.simulationState = 'simulating';
+      this.errorMessage = null;
+      try {
+        const result = await loadUltraJobResult(baseUrl, idToLoad, undefined, (p) => {
+          this.progress = p;
+        });
+        const request = {
+          lat: this.splatParams.transmitter.tx_lat,
+          lon: this.splatParams.transmitter.tx_lon,
+          radius: this.splatParams.simulation.simulation_extent,
+        };
+        const cropped = cropToRadius(result, request.lat, request.lon, request.radius);
+        const siteParams = cloneObject(this.splatParams);
+        const id = generateUUID();
+        const site: SiteCoverage = {
+          id,
+          name: siteParams.transmitter.name || 'Ultra Site',
+          lat: request.lat,
+          lon: request.lon,
+          result: cropped,
+          params: siteParams,
+          color: nextSiteColor(this.sites.length),
+          visible: true,
+          opacity: 0.7,
+        };
+        this.sites.push(site);
+        this.activeSiteId = id;
+        this.lastUltraJobId = idToLoad;
+
+        if (map) {
+          const elevText = this.elevationProbe?.ground_m
+            ? `${Math.round(this.elevationProbe.ground_m + siteParams.transmitter.tx_alt)} m`
+            : undefined;
+          const popup = new maplibregl.Popup({ closeButton: true, offset: 46 })
+            .setDOMContent(buildSitePopup(site));
+          const marker = new maplibregl.Marker({ element: sitePinElement(elevText), anchor: 'bottom' })
+            .setLngLat([request.lon, request.lat])
+            .setPopup(popup)
+            .addTo(map);
+          siteMarkers.set(id, marker);
+        }
+
+        this.syncOverlays();
+        this.simulationState = 'completed';
+        postCoverageToBridge(site);
+        this.splatParams.transmitter.name = randanimalSync();
+      } catch (error) {
+        console.error('Failed to load ultra job:', error);
+        this.errorMessage = error instanceof Error ? error.message : String(error);
+        this.simulationState = 'failed';
+      } finally {
+        this.progress = null;
       }
     }
   }

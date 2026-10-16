@@ -2,12 +2,27 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 import json
+import math
 import struct
 import numpy as np
 
 from .geo import utm30_to_latlon
 from .surface import SurfaceGrid
+
+
+def sanitize_for_json(data: Any) -> Any:
+    """Recursively convert NaN and Infinity floats to None (JSON null)."""
+    if isinstance(data, float):
+        if math.isnan(data) or math.isinf(data):
+            return None
+        return data
+    if isinstance(data, dict):
+        return {k: sanitize_for_json(v) for k, v in data.items()}
+    if isinstance(data, (list, tuple)):
+        return [sanitize_for_json(v) for v in data]
+    return data
 
 
 SOURCE_LABELS = {
@@ -54,7 +69,7 @@ def write_surface_artifact(grid: SurfaceGrid, out_dir: str | Path) -> SurfaceArt
     meta_path = out / "surface_meta.json"
 
     values_arr = np.asarray(grid.values, dtype=np.float32).reshape(-1)
-    clean_vals = np.nan_to_num(values_arr, nan=-32768.0)
+    clean_vals = np.nan_to_num(values_arr, nan=0.0)
     values_i16 = np.clip(np.round(clean_vals), -32768, 32767).astype("<i2")
     surface_path.write_bytes(values_i16.tobytes())
 
@@ -80,6 +95,14 @@ def write_surface_artifact(grid: SurfaceGrid, out_dir: str | Path) -> SurfaceArt
     ]
     lats = [lat for lat, _ in corners]
     lons = [lon for _, lon in corners]
+
+    min_val = grid.min_value
+    max_val = grid.max_value
+    if min_val is not None and (math.isnan(min_val) or math.isinf(min_val)):
+        min_val = None
+    if max_val is not None and (math.isnan(max_val) or math.isinf(max_val)):
+        max_val = None
+
     artifact = SurfaceArtifact(
         path=str(surface_path),
         meta_path=str(meta_path),
@@ -91,8 +114,8 @@ def write_surface_artifact(grid: SurfaceGrid, out_dir: str | Path) -> SurfaceArt
         min_y=grid.min_y,
         max_x=grid.max_x,
         max_y=grid.max_y,
-        min_value=grid.min_value,
-        max_value=grid.max_value,
+        min_value=min_val,
+        max_value=max_val,
         bounds_wgs84={
             "north": max(lats),
             "south": min(lats),
@@ -103,5 +126,8 @@ def write_surface_artifact(grid: SurfaceGrid, out_dir: str | Path) -> SurfaceArt
         mode=grid.mode,
         source_counts=counts,
     )
-    meta_path.write_text(json.dumps(asdict(artifact), indent=2) + "\n", encoding="utf-8")
+    meta_path.write_text(
+        json.dumps(sanitize_for_json(asdict(artifact)), indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
     return artifact

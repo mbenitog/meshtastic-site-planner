@@ -68,11 +68,17 @@ class SurfaceGrid:
 
     @property
     def min_value(self) -> float:
-        return float(self.values.min()) if self.values.size else 0.0
+        if not self.values.size:
+            return 0.0
+        val = float(np.nanmin(self.values))
+        return 0.0 if (np.isnan(val) or np.isinf(val)) else val
 
     @property
     def max_value(self) -> float:
-        return float(self.values.max()) if self.values.size else 0.0
+        if not self.values.size:
+            return 0.0
+        val = float(np.nanmax(self.values))
+        return 0.0 if (np.isnan(val) or np.isinf(val)) else val
 
 
 def _coverage_lookup_filled(
@@ -85,7 +91,7 @@ def _coverage_lookup_filled(
     array so this lookup always returns a finite value.
     """
     if grid.width <= 0 or grid.height <= 0:
-        return np.full((ys.shape[0], xs.shape[0]), np.nan, dtype=np.float32)
+        return np.zeros((ys.shape[0], xs.shape[0]), dtype=np.float32)
     cols = np.clip(
         np.round((xs[None, :] - grid.min_x) / grid.dx).astype(np.int64),
         0,
@@ -103,7 +109,7 @@ def _coverage_lookup_filled(
             0,
             grid.height - 1,
         )
-    return grid._filled[rows, cols].astype(np.float32, copy=False)
+    return np.nan_to_num(grid._filled[rows, cols].astype(np.float32, copy=False), nan=0.0)
 
 
 def _arcgrid_lookup_filled(
@@ -329,6 +335,9 @@ class SurfaceBuilder:
                 del surface_5m_m, has_lod
 
             del has_building, has_vegetation
+
+        values_arr = np.nan_to_num(values_arr, nan=0.0)
+        terrain_arr = np.nan_to_num(terrain_arr, nan=0.0)
 
         return SurfaceGrid(
             width=width,

@@ -247,27 +247,41 @@ def get_optimal_gpu_slots(
         max_alloc_mb = d.get("max_alloc_mb", 2048)
         if vram_mb <= 0:
             continue
-        vram_budget_mb = int(vram_mb * 0.80)
 
-        # Dynamic profile budget: scale with hardware compute units & VRAM
-        # Lower-end cards use 512-768 MB. Top-tier cards (RTX 4090 / 3090 / A100)
-        # scale up to 1500-2000 MB to keep all SMs filled with large batches.
-        ideal_profile_budget_mb = min(max_alloc_mb, max(512, int(compute_units * 12)))
-        worker_footprint_mb = surf_bytes_mb + 64 + ideal_profile_budget_mb
+        # Usable VRAM: reserve 15% (or at least 384 MB) for OS display manager, X11/Wayland, and driver heap
+        vram_usable_mb = max(512, int(vram_mb * 0.85) - 384)
 
-        # Dynamically scale workers per GPU based on VRAM and compute units:
-        # e.g., ~2.5GB VRAM per worker, and at least ~10 SMs per worker.
-        dynamic_max_workers = max(1, min(vram_mb // 2500, max(1, compute_units // 10)))
-        max_workers_for_dev = int(env_max_w_per_gpu) if env_max_w_per_gpu else min(8, dynamic_max_workers)
+        # Real per-worker memory footprint:
+        # - Surface grid buffer in int16: surf_bytes_mb (e.g. 1098 MB at 30km, 763 MB at 25km)
+        # - OpenCL context + JIT compiled program + CUDA runtime heap: ~384 MB
+        # - Output signal & mask buffers + dynamic command scratch: ~128 MB
+        # Total fixed overhead before profile buffer = surf_bytes_mb + 512 MB
+        fixed_overhead_per_worker = surf_bytes_mb + 512
+        min_worker_footprint = fixed_overhead_per_worker + min_profile_budget_mb
 
-        dev_workers = max(1, min(max_workers_for_dev, vram_budget_mb // max(1, worker_footprint_mb)))
-        vram_per_worker_mb = vram_budget_mb // max(1, dev_workers)
-        profile_budget_mb = min(ideal_profile_budget_mb, max(min_profile_budget_mb, vram_per_worker_mb - surf_bytes_mb - 64))
+        # Maximum workers that physically fit in usable VRAM without memory allocation failure
+        max_workers_by_vram = max(1, vram_usable_mb // max(1, min_worker_footprint))
+
+        # Hardware saturation: each worker requires sufficient Compute Units (SMs)
+        # to achieve high execution occupancy without warp-scheduling contention.
+        # Giving at least 14 CUs per worker prevents performance degradation.
+        max_workers_by_cu = max(1, compute_units // 14)
+
+        dev_workers = max(1, min(max_workers_by_vram, max_workers_by_cu))
+        if env_max_w_per_gpu:
+            dev_workers = max(1, min(dev_workers, int(env_max_w_per_gpu)))
+        dev_workers = min(dev_workers, max(1, total_tiles))
+
+        # Dynamically compute safe, maximal profile budget for each worker:
+        vram_per_worker_mb = vram_usable_mb // dev_workers
+        available_profile_mb = vram_per_worker_mb - fixed_overhead_per_worker
+        profile_budget_mb = min(max_alloc_mb, max(min_profile_budget_mb, available_profile_mb))
         if user_budget is not None:
             profile_budget_mb = user_budget
 
-        logger.info("  ↳ [GPU %d:%d] %s (%d MB VRAM, %d CUs) -> %d workers (~%d MB profile/w)",
-                    d["platform"], d["device"], d["name"], vram_mb, compute_units, dev_workers, profile_budget_mb)
+        logger.info("  ↳ [GPU %d:%d] %s (%d MB VRAM, %d CUs) -> %d workers (~%d MB profile/w, ~%d MB total/w)",
+                    d["platform"], d["device"], d["name"], vram_mb, compute_units, dev_workers, profile_budget_mb,
+                    fixed_overhead_per_worker + profile_budget_mb)
 
         d_list = []
         for _ in range(dev_workers):
@@ -275,6 +289,7 @@ def get_optimal_gpu_slots(
                 "platform": d["platform"],
                 "device": d["device"],
                 "budget_mb": profile_budget_mb,
+                "vram_mb": vram_mb,
                 "name": d["name"],
             })
         dev_slots.append(d_list)
@@ -477,6 +492,18 @@ def _run_surface_subprocess(
     import sys as _sys
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    surface_done = out_dir / "surface_done.flag"
+    surface_meta = out_dir / "surface_meta.json"
+    surface_bin = out_dir / "surface_i16le.bin"
+    runner_in = out_dir / "runner_input.json"
+    if surface_done.exists() and surface_meta.exists() and surface_bin.exists() and runner_in.exists() and surface_bin.stat().st_size > 0:
+        logger.info("⚡ [Job %s] Reusing already built surface artifact in %s", job_id, out_dir)
+        meta = json.loads(surface_meta.read_text(encoding="utf-8"))
+        artifact = SurfaceArtifact(**meta)
+        runner_input_dict = json.loads(runner_in.read_text(encoding="utf-8"))
+        runner_input = NativeRunnerInput(**runner_input_dict)
+        return artifact, runner_input, None
+
     payload_file = out_dir / "surface_payload.json"
     payload_file.write_text(
         json.dumps({"request": dict(request), "out_dir": str(out_dir)}),
@@ -726,7 +753,7 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
             job["status"] = "surface_ready"
             set_progress(job, "finalize", 0.75)
             job["message"] = native_result.message
-            logger.warn("⚠️ [Job %s] Missing native runner binary", job_id)
+            logger.warning("⚠️ [Job %s] Missing native runner binary", job_id)
         else:
             job["status"] = "failed"
             set_progress(job, "finalize", 1.0)
@@ -857,7 +884,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
     import os
     import subprocess
     from pathlib import Path
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
     binary, opencl_kernel = _resolve_native_binary()
     if not binary.exists():
@@ -886,7 +913,8 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
     pending_tiles = []
     for tile in tiles:
         sig_path = out_dir / f"coverage_x{tile.x0}_y{tile.y0}.signal_i16le.bin"
-        if sig_path.exists():
+        expected_size = tile.width * tile.height * 2
+        if sig_path.exists() and sig_path.stat().st_size == expected_size:
             _advance_tile_progress_throttled(job_id, total, cells_per_tile=avg_cells_per_tile)
         else:
             pending_tiles.append(tile)
@@ -999,50 +1027,118 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
             _advance_tile_progress_throttled(job_id, total, cells_per_tile=avg_cells_per_tile)
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            future_to_tile = {}
-            for idx, tile in enumerate(pending_tiles):
-                slot = active_slots[idx % len(active_slots)] if active_slots else None
-                slot_budget = slot["budget_mb"] if slot else None
-                slot_plat = slot["platform"] if slot else None
-                slot_dev = slot["device"] if slot else None
+            slots_by_vram = sorted(active_slots, key=lambda s: s.get("vram_mb", 0), reverse=True) if active_slots else []
+            fallback_slot = slots_by_vram[0] if slots_by_vram else (active_slots[0] if active_slots else None)
+
+            cpu_binary_candidate = Path(binary).with_name("ultra_cli")
+            cpu_binary = cpu_binary_candidate if cpu_binary_candidate.exists() else Path(binary)
+
+            pending_queue: list[TileSpec] = list(pending_tiles)
+            tile_attempts: dict[tuple[int, int], int] = {}
+            in_flight: dict[Any, tuple[TileSpec, dict | None, int]] = {}
+            slot_idx = 0
+
+            def _submit_tile(tile: TileSpec, attempt: int) -> None:
+                nonlocal slot_idx
+                if attempt == 0:
+                    slot = active_slots[slot_idx % len(active_slots)] if active_slots else None
+                    slot_idx += 1
+                    target_bin = str(binary)
+                    target_kernel = opencl_kernel
+                    budget = slot["budget_mb"] if slot else None
+                    plat = slot["platform"] if slot else None
+                    dev = slot["device"] if slot else None
+                    t_threads = threads_per_call
+                elif attempt == 1:
+                    # Retry 1: Fallback to the GPU with the most VRAM, with halved memory budget
+                    slot = fallback_slot
+                    target_bin = str(binary)
+                    target_kernel = opencl_kernel
+                    budget = max(128, (slot["budget_mb"] // 2)) if slot and slot.get("budget_mb") else 256
+                    plat = slot["platform"] if slot else None
+                    dev = slot["device"] if slot else None
+                    t_threads = 1
+                else:
+                    # Retry 2: Ultimate fallback to CPU execution (full system RAM, no VRAM limits)
+                    slot = {"name": "CPU", "budget_mb": None, "platform": None, "device": None}
+                    target_bin = str(cpu_binary)
+                    target_kernel = ""
+                    budget = None
+                    plat = None
+                    dev = None
+                    t_threads = max(1, cpu_count // max(1, workers))
+
                 fut = executor.submit(
                     _run_one_tile,
-                    str(binary),
+                    target_bin,
                     asdict(artifact),
                     asdict(tile),
                     request,
                     tx_x,
                     tx_y,
                     str(out_prefix),
-                    threads_per_call,
+                    t_threads,
                     job_id,
                     registry,
-                    opencl_kernel,
-                    slot_budget,
-                    slot_plat,
-                    slot_dev,
+                    target_kernel,
+                    budget,
+                    plat,
+                    dev,
                 )
-                future_to_tile[fut] = tile
-            for future in as_completed(future_to_tile):
-                tile = future_to_tile[future]
-                try:
-                    future.result()
-                except Exception as exc:
-                    err_msg = str(exc)
-                    logger.error("❌ [Job %s] Tile (%d,%d) failed: %s", job_id, tile.x0, tile.y0, err_msg)
-                    return NativeRunResult(
-                        status="failed",
-                        model="itm_projected_grid",
-                        message=f"tile ({tile.x0},{tile.y0}) failed: {err_msg}",
-                    )
-                _advance_tile_progress_throttled(job_id, total, cells_per_tile=avg_cells_per_tile)
+                in_flight[fut] = (tile, slot, attempt)
+
+            # Keep pool saturated with work (up to 2 * workers in-flight)
+            max_in_flight = max(1, workers * 2)
+            while pending_queue and len(in_flight) < max_in_flight:
+                _submit_tile(pending_queue.pop(0), attempt=0)
+
+            while in_flight:
                 if is_cancel_requested(job_id):
+                    _terminate_job_subprocesses(job_id)
                     executor.shutdown(wait=False, cancel_futures=True)
                     return NativeRunResult(
                         status="cancelled",
                         model="itm_projected_grid",
                         message="Ultra job cancelled during tiled native execution.",
                     )
+
+                done, _ = wait(
+                    in_flight.keys(),
+                    return_when=FIRST_COMPLETED,
+                )
+
+                for fut in done:
+                    tile, slot, attempt = in_flight.pop(fut)
+                    slot_name = slot.get("name", "Worker") if slot else "Worker"
+                    try:
+                        fut.result()
+                        _advance_tile_progress_throttled(job_id, total, cells_per_tile=avg_cells_per_tile)
+                    except Exception as exc:
+                        err_msg = str(exc)
+                        next_attempt = attempt + 1
+                        tile_attempts[(tile.x0, tile.y0)] = next_attempt
+                        if next_attempt < 3:
+                            recovery_desc = "highest VRAM GPU with reduced memory budget" if next_attempt == 1 else "CPU fallback"
+                            logger.warning(
+                                "⚠️ [Job %s] Tile (%d,%d) failed on %s (attempt %d/3): %s. Recovering via %s...",
+                                job_id, tile.x0, tile.y0, slot_name, next_attempt, err_msg, recovery_desc
+                            )
+                            _submit_tile(tile, attempt=next_attempt)
+                        else:
+                            logger.error(
+                                "❌ [Job %s] Tile (%d,%d) failed permanently after 3 attempts: %s",
+                                job_id, tile.x0, tile.y0, err_msg
+                            )
+                            _terminate_job_subprocesses(job_id)
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            return NativeRunResult(
+                                status="failed",
+                                model="itm_projected_grid",
+                                message=f"tile ({tile.x0},{tile.y0}) failed: {err_msg}",
+                            )
+
+                    while pending_queue and len(in_flight) < max_in_flight:
+                        _submit_tile(pending_queue.pop(0), attempt=0)
 
     meta = aggregate_tiles(artifact=artifact, tiles=tiles, out_dir=out_dir)
     meta["rx_sensitivity_dbm"] = request["rx_sensitivity_dbm"]
@@ -1390,6 +1486,56 @@ def create_ultra_job(
                 continue
 
     job_id = str(uuid4())
+
+    # Cache adoption: if an identical prior job exists whose surface was built, adopt it
+    # along with any completed tile files so computation resumes without downloading or recalculating.
+    try:
+        new_dir = job_dir(job_id)
+        candidate_dirs = [job_dir(jid) for jid, j in jobs.items() if j.get("request") == req_dict and jid != job_id]
+        if JOB_ROOT.exists():
+            for jf in JOB_ROOT.glob("*/job.json"):
+                cand_p = jf.parent
+                if cand_p not in candidate_dirs and cand_p.name != job_id:
+                    try:
+                        p_job = load_job(cand_p.name)
+                        if p_job and p_job.get("request") == req_dict:
+                            candidate_dirs.append(cand_p)
+                    except Exception:
+                        pass
+        for cand_dir in candidate_dirs:
+            flag = cand_dir / "surface_done.flag"
+            s_bin = cand_dir / "surface_i16le.bin"
+            s_meta = cand_dir / "surface_meta.json"
+            if flag.exists() and s_bin.exists() and s_meta.exists() and s_bin.stat().st_size > 0:
+                logger.info("⚡ [Job %s] Adopting cached surface and partial tiles from prior matching job %s", job_id, cand_dir.name)
+                new_dir.mkdir(parents=True, exist_ok=True)
+                for item in cand_dir.glob("surface*"):
+                    dest = new_dir / item.name
+                    if not dest.exists():
+                        try:
+                            os.link(item, dest)
+                        except Exception:
+                            import shutil
+                            shutil.copy2(item, dest)
+                rin = cand_dir / "runner_input.json"
+                if rin.exists() and not (new_dir / rin.name).exists():
+                    try:
+                        os.link(rin, new_dir / rin.name)
+                    except Exception:
+                        import shutil
+                        shutil.copy2(rin, new_dir / rin.name)
+                for tile_file in cand_dir.glob("coverage_x*"):
+                    dest = new_dir / tile_file.name
+                    if not dest.exists():
+                        try:
+                            os.link(tile_file, dest)
+                        except Exception:
+                            import shutil
+                            shutil.copy2(tile_file, dest)
+                break
+    except Exception as exc:
+        logger.warning("Could not adopt cache from prior job: %s", exc)
+
     estimate = estimate_grid(payload.radius_km, payload.resolution_m)
     job = {
         "status": "queued",

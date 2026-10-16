@@ -1433,3 +1433,5 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(router, prefix=ULTRA_API_PREFIX)
+if ULTRA_API_PREFIX:
+    app.include_router(router, prefix="")

@@ -51,6 +51,26 @@ def test_get_optimal_gpu_slots_scales_with_surface_footprint():
         for s in slots_30km:
             assert s["budget_mb"] >= 256
 
+    # Verify high-end GPU scaling (e.g. 24GB VRAM, 128 CUs) scales up workers and budget automatically
+    high_end_probe = {
+        "devices": [
+            {
+                "platform": 0,
+                "device": 0,
+                "name": "Generic High-End 24GB GPU",
+                "type": "GPU",
+                "vram_mb": 24576,
+                "compute_units": 128,
+                "max_alloc_mb": 6144,
+            }
+        ]
+    }
+    with patch("backend.ultra.main._probe_gpu", return_value=high_end_probe):
+        slots_he = ultra_main.get_optimal_gpu_slots(binary, "kernel_str", total_tiles=289, cpu_count=32, surf_bytes_mb=1098)
+        assert len(slots_he) >= 6
+        for s in slots_he:
+            assert s["budget_mb"] >= 1024
+
 
 def test_create_ultra_job_adopts_surface_from_prior_job(tmp_path: Path):
     import sys

@@ -293,11 +293,11 @@ def get_optimal_gpu_slots(
         vram_usable_mb = max(512, int(vram_mb * 0.85) - 384)
 
         # Real per-worker memory footprint:
-        # - Surface grid buffer in int16: surf_bytes_mb (e.g. 1098 MB at 30km, 763 MB at 25km)
-        # - OpenCL context + JIT compiled program + CUDA runtime heap: ~384 MB
-        # - Output signal & mask buffers + dynamic command scratch: ~128 MB
-        # Total fixed overhead before profile buffer = surf_bytes_mb + 512 MB
-        fixed_overhead_per_worker = surf_bytes_mb + 512
+        # - Cropped 2D surface subgrid [TX..tile] in int16: at most ~28% of full grid when TX is centered
+        #   (~12% average); we budget 35% of surf_bytes_mb for peak concurrent subgrid footprint.
+        # - OpenCL context + JIT compiled program + runtime heap: ~384 MB
+        effective_surf_mb = int(surf_bytes_mb * 0.35)
+        fixed_overhead_per_worker = effective_surf_mb + 384
         min_worker_footprint = fixed_overhead_per_worker + min_profile_budget_mb
 
         # Maximum workers that physically fit in usable VRAM without memory allocation failure
@@ -1081,37 +1081,43 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
             _advance_tile_progress_throttled(job_id, total, cells_per_tile=avg_cells_per_tile)
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            slots_by_vram = sorted(active_slots, key=lambda s: s.get("vram_mb", 0), reverse=True) if active_slots else []
-            fallback_slot = slots_by_vram[0] if slots_by_vram else (active_slots[0] if active_slots else None)
-
-            pending_queue: list[TileSpec] = list(pending_tiles)
+            free_slots: list[dict] = list(active_slots) if active_slots else []
+            pending_queue: list[tuple[TileSpec, int]] = [(t, 0) for t in pending_tiles]
             tile_attempts: dict[tuple[int, int], int] = {}
             in_flight: dict[Any, tuple[TileSpec, dict | None, int]] = {}
-            slot_idx = 0
 
-            def _submit_tile(tile: TileSpec, attempt: int) -> None:
-                nonlocal slot_idx
+            def _can_dispatch() -> bool:
+                if not pending_queue:
+                    return False
+                if active_slots:
+                    return len(free_slots) > 0 and len(in_flight) < workers
+                return len(in_flight) < workers
+
+            def _dispatch_next() -> None:
+                tile, attempt = pending_queue.pop(0)
+                claimed_slot: dict | None = None
                 if attempt == 0 and active_slots:
-                    slot = active_slots[slot_idx % len(active_slots)]
-                    slot_idx += 1
+                    claimed_slot = free_slots.pop(0)
                     target_bin = str(binary)
                     target_kernel = opencl_kernel
-                    budget = slot["budget_mb"] if slot else None
-                    plat = slot["platform"] if slot else None
-                    dev = slot["device"] if slot else None
+                    budget = claimed_slot["budget_mb"]
+                    plat = claimed_slot["platform"]
+                    dev = claimed_slot["device"]
                     t_threads = threads_per_call
                 elif attempt == 1 and active_slots:
-                    # Retry 1: Fallback to the GPU with the most VRAM, with halved memory budget
-                    slot = fallback_slot
+                    # Retry 1: Acquire the available free slot with the highest VRAM and halve its memory budget
+                    best_idx = max(range(len(free_slots)), key=lambda i: free_slots[i].get("vram_mb", 0))
+                    claimed_slot = free_slots.pop(best_idx)
                     target_bin = str(binary)
                     target_kernel = opencl_kernel
-                    budget = max(128, (slot["budget_mb"] // 2)) if slot and slot.get("budget_mb") else 256
-                    plat = slot["platform"] if slot else None
-                    dev = slot["device"] if slot else None
+                    budget = max(128, (claimed_slot["budget_mb"] // 2)) if claimed_slot.get("budget_mb") else 256
+                    plat = claimed_slot["platform"]
+                    dev = claimed_slot["device"]
                     t_threads = 1
                 else:
                     # CPU execution (full system RAM, no VRAM limits, standard multi-threaded itwom)
-                    slot = {"name": "CPU", "budget_mb": None, "platform": None, "device": None}
+                    if active_slots and free_slots:
+                        claimed_slot = free_slots.pop(0)
                     target_bin = str(cpu_binary)
                     target_kernel = ""
                     budget = None
@@ -1136,12 +1142,10 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                     plat,
                     dev,
                 )
-                in_flight[fut] = (tile, slot, attempt)
+                in_flight[fut] = (tile, claimed_slot, attempt)
 
-            # Keep pool saturated with work (up to 2 * workers in-flight)
-            max_in_flight = max(1, workers * 2)
-            while pending_queue and len(in_flight) < max_in_flight:
-                _submit_tile(pending_queue.pop(0), attempt=0)
+            while _can_dispatch():
+                _dispatch_next()
 
             while in_flight:
                 if is_cancel_requested(job_id):
@@ -1159,8 +1163,15 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                 )
 
                 for fut in done:
-                    tile, slot, attempt = in_flight.pop(fut)
-                    slot_name = slot.get("name", "Worker") if slot else "Worker"
+                    tile, claimed_slot, attempt = in_flight.pop(fut)
+                    slot_name = (
+                        "CPU"
+                        if (attempt >= 2 or not active_slots)
+                        else (claimed_slot.get("name", "Worker") if claimed_slot else "Worker")
+                    )
+                    if claimed_slot is not None and active_slots:
+                        free_slots.append(claimed_slot)
+
                     try:
                         fut.result()
                         _advance_tile_progress_throttled(job_id, total, cells_per_tile=avg_cells_per_tile)
@@ -1178,7 +1189,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                                 "⚠️ [Job %s] Tile (%d,%d) failed on %s (attempt %d/3): %s. Recovering via %s...",
                                 job_id, tile.x0, tile.y0, slot_name, next_attempt, err_msg, recovery_desc
                             )
-                            _submit_tile(tile, attempt=next_attempt)
+                            pending_queue.insert(0, (tile, next_attempt))
                         else:
                             logger.error(
                                 "❌ [Job %s] Tile (%d,%d) failed permanently after 3 attempts: %s",
@@ -1192,8 +1203,8 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                                 message=f"tile ({tile.x0},{tile.y0}) failed: {err_msg}",
                             )
 
-                    while pending_queue and len(in_flight) < max_in_flight:
-                        _submit_tile(pending_queue.pop(0), attempt=0)
+                    while _can_dispatch():
+                        _dispatch_next()
 
     meta = aggregate_tiles(artifact=artifact, tiles=tiles, out_dir=out_dir)
     meta["rx_sensitivity_dbm"] = request["rx_sensitivity_dbm"]

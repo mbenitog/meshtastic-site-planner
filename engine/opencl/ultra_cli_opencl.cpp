@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <sys/types.h>
 
 #ifdef __APPLE__
 #include <OpenCL/opencl.h>
@@ -328,17 +329,58 @@ int main(int argc, char **argv) {
     if (!ok || width <= 0 || height <= 0 || resolution <= 0 || freq <= 0 || tx_power_w <= 0)
         return 2;
 
-    /* ---- load surface ---- */
-    size_t surf_cells = (size_t)width * (size_t)height;
+    int tx_col = clamp_i((int)llround((tx_x - min_x) / resolution), 0, width - 1);
+    int tx_row = clamp_i((int)llround((max_y - tx_y) / resolution), 0, height - 1);
+
+    /* ---- load minimal 2D surface subgrid covering [TX .. tile] ---- */
+    int crop_x0 = std::max(0, std::min(tx_col, tile_x0) - 2);
+    int crop_x1 = std::min(width - 1, std::max(tx_col, tile_x0 + tile_w - 1) + 2);
+    int crop_y0 = std::max(0, std::min(tx_row, tile_y0) - 2);
+    int crop_y1 = std::min(height - 1, std::max(tx_row, tile_y0 + tile_h - 1) + 2);
+    int crop_w = crop_x1 - crop_x0 + 1;
+    int crop_h = crop_y1 - crop_y0 + 1;
+
+    size_t surf_cells = (size_t)crop_w * (size_t)crop_h;
     std::vector<int16_t> surface(surf_cells);
     FILE *fp = fopen(surface_path, "rb");
     if (!fp) { fprintf(stderr, "failed to open %s\n", surface_path); return 1; }
-    size_t nrd = fread(surface.data(), sizeof(int16_t), surf_cells, fp);
-    fclose(fp);
-    if (nrd != surf_cells) { fprintf(stderr, "short read from %s\n", surface_path); return 1; }
-
-    int tx_col = clamp_i((int)llround((tx_x - min_x) / resolution), 0, width - 1);
-    int tx_row = clamp_i((int)llround((max_y - tx_y) / resolution), 0, height - 1);
+    if (crop_x0 == 0 && crop_w == width) {
+        if (fseeko(fp, (off_t)crop_y0 * (off_t)width * (off_t)sizeof(int16_t), SEEK_SET) != 0) {
+            fclose(fp);
+            fprintf(stderr, "seek failed on %s\n", surface_path);
+            return 1;
+        }
+        size_t nrd = fread(surface.data(), sizeof(int16_t), surf_cells, fp);
+        fclose(fp);
+        if (nrd != surf_cells) { fprintf(stderr, "short read from %s\n", surface_path); return 1; }
+    } else {
+        if (fseeko(fp, (off_t)crop_y0 * (off_t)width * (off_t)sizeof(int16_t), SEEK_SET) != 0) {
+            fclose(fp);
+            fprintf(stderr, "seek failed on %s\n", surface_path);
+            return 1;
+        }
+        int chunk_rows = std::max(1, (int)((8 * 1024 * 1024) / ((size_t)width * sizeof(int16_t))));
+        chunk_rows = std::min(chunk_rows, crop_h);
+        std::vector<int16_t> row_buf((size_t)chunk_rows * (size_t)width);
+        int rows_done = 0;
+        while (rows_done < crop_h) {
+            int rcount = std::min(chunk_rows, crop_h - rows_done);
+            size_t want = (size_t)rcount * (size_t)width;
+            size_t nrd = fread(row_buf.data(), sizeof(int16_t), want, fp);
+            if (nrd != want) {
+                fclose(fp);
+                fprintf(stderr, "short read from %s\n", surface_path);
+                return 1;
+            }
+            for (int r = 0; r < rcount; r++) {
+                memcpy(surface.data() + (size_t)(rows_done + r) * (size_t)crop_w,
+                       row_buf.data() + (size_t)r * (size_t)width + crop_x0,
+                       (size_t)crop_w * sizeof(int16_t));
+            }
+            rows_done += rcount;
+        }
+        fclose(fp);
+    }
 
     /* ---- compute tile geometry ---- */
     int total_cells = tile_w * tile_h;
@@ -433,8 +475,7 @@ int main(int argc, char **argv) {
     }
 
     size_t surf_bytes = surf_cells * sizeof(int16_t);
-    size_t out_bytes = (size_t)total_cells * (sizeof(int16_t) + sizeof(uint8_t));
-    size_t fixed_bytes = surf_bytes + out_bytes;
+    size_t fixed_bytes = surf_bytes;
 
     size_t mem_budget = (size_t)512 * 1024 * 1024;
     if (global_mem > 0) {
@@ -495,22 +536,17 @@ int main(int argc, char **argv) {
     size_t alloc_batch = ((size_t)batch_size + local - 1) / local * local;
     if (alloc_batch < local) alloc_batch = local;
 
-    fprintf(stderr, "device: %s  vram=%lluMB  budget=%lluMB (%.0f%%)  max_alloc=%lluMB\n",
+    fprintf(stderr, "device: %s  vram=%lluMB  budget=%lluMB (%.0f%%)  max_alloc=%lluMB  surf_crop=%dx%d (%lluMB)\n",
             pick.name, (unsigned long long)(global_mem / (1024 * 1024)),
             (unsigned long long)(mem_budget / (1024 * 1024)), vram_frac * 100.0,
-            (unsigned long long)(max_alloc / (1024 * 1024)));
+            (unsigned long long)(max_alloc / (1024 * 1024)),
+            crop_w, crop_h, (unsigned long long)(surf_bytes / (1024 * 1024)));
     fprintf(stderr, "tile: x0=%d y0=%d w=%d h=%d  cells=%d  max_segs=%d  stride=%d  batch=%d  alloc_batch=%zu  wg=%zu\n",
             tile_x0, tile_y0, tile_w, tile_h, total_cells, max_segments, stride_prof, batch_size, alloc_batch, local);
 
     /* ---- allocate GPU buffers ---- */
     cl_mem d_surf = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                    surf_cells * sizeof(int16_t), surface.data(), &e);
-    CL_CHECK(e);
-    cl_mem d_signal = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
-                                     (size_t)total_cells * sizeof(int16_t), NULL, &e);
-    CL_CHECK(e);
-    cl_mem d_mask = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY,
-                                   (size_t)total_cells * sizeof(uint8_t), NULL, &e);
     CL_CHECK(e);
 
     cl_mem d_prof = NULL;
@@ -574,10 +610,11 @@ int main(int argc, char **argv) {
     /* 0: surface, 1: surf_w, 2: surf_h, 3: tx_col, 4: tx_row, 5: resolution,
        6: tile_x0, 7: tile_y0, 8: tile_w, 9: tile_h,
        10: batch_start, 11: batch_count, 12: total_cells,
-       13: prof_pool, 14: stride_prof */
+       13: prof_pool, 14: stride_prof,
+       15: surf_x0, 16: surf_y0, 17: full_w, 18: full_h */
     CL_CHECK(clSetKernelArg(kern_build, 0, sizeof(cl_mem), &d_surf));
-    CL_CHECK(clSetKernelArg(kern_build, 1, sizeof(int), &width));
-    CL_CHECK(clSetKernelArg(kern_build, 2, sizeof(int), &height));
+    CL_CHECK(clSetKernelArg(kern_build, 1, sizeof(int), &crop_w));
+    CL_CHECK(clSetKernelArg(kern_build, 2, sizeof(int), &crop_h));
     CL_CHECK(clSetKernelArg(kern_build, 3, sizeof(int), &tx_col));
     CL_CHECK(clSetKernelArg(kern_build, 4, sizeof(int), &tx_row));
     SET_REAL(kern_build, 5, resolution, use_double);
@@ -588,6 +625,10 @@ int main(int argc, char **argv) {
     /* 10-12 set per batch */
     CL_CHECK(clSetKernelArg(kern_build, 13, sizeof(cl_mem), &d_prof));
     CL_CHECK(clSetKernelArg(kern_build, 14, sizeof(int), &stride_prof));
+    CL_CHECK(clSetKernelArg(kern_build, 15, sizeof(int), &crop_x0));
+    CL_CHECK(clSetKernelArg(kern_build, 16, sizeof(int), &crop_y0));
+    CL_CHECK(clSetKernelArg(kern_build, 17, sizeof(int), &width));
+    CL_CHECK(clSetKernelArg(kern_build, 18, sizeof(int), &height));
 
     /* ---- set static args for itm_p2p_kernel (validated) ---- */
     /* 0: profiles, 1: stride, 2: scratch,
@@ -636,9 +677,11 @@ int main(int argc, char **argv) {
                 dst[1] = dist / segs;
                 for (int i = 0; i <= segs; i++) {
                     double t = (double)i / (double)segs;
-                    int c = clamp_i((int)llround((double)tx_col + (double)dx * t), 0, width - 1);
-                    int r = clamp_i((int)llround((double)tx_row + (double)dy * t), 0, height - 1);
-                    dst[i + 2] = (double)surface[(size_t)r * width + c];
+                    int gc = clamp_i((int)llround((double)tx_col + (double)dx * t), 0, width - 1);
+                    int gr = clamp_i((int)llround((double)tx_row + (double)dy * t), 0, height - 1);
+                    int c = clamp_i(gc - crop_x0, 0, crop_w - 1);
+                    int r = clamp_i(gr - crop_y0, 0, crop_h - 1);
+                    dst[i + 2] = (double)surface[(size_t)r * crop_w + c];
                 }
                 double pad = dst[segs + 2];
                 for (int i = segs + 3; i < stride_prof; i++) dst[i] = pad;
@@ -652,10 +695,9 @@ int main(int argc, char **argv) {
                 for (int g = 0; g < batch_count; g++)
                     for (int i = 0; i < stride_prof; i++)
                         tmp[g * stride_prof + i] = (float)cpu_prof_buf[g * stride_prof + i];
-                CL_CHECK(clEnqueueWriteBuffer(q, d_prof, CL_FALSE, 0, bytes,
+                CL_CHECK(clEnqueueWriteBuffer(q, d_prof, CL_TRUE, 0, bytes,
                              tmp.data(), 0, NULL, NULL));
             }
-            CL_CHECK(clFinish(q));
         } else {
             CL_CHECK(clSetKernelArg(kern_build, 10, sizeof(int), &batch_start));
             CL_CHECK(clSetKernelArg(kern_build, 11, sizeof(int), &batch_count));
@@ -676,7 +718,6 @@ int main(int argc, char **argv) {
                 continue;
             }
             CL_CHECK(kerr);
-            CL_CHECK(clFinish(q));
         }
 
         /* Run itm_p2p_kernel — global size = batch_count (kernel uses get_global_id) */
@@ -697,18 +738,33 @@ int main(int argc, char **argv) {
             continue;
         }
         CL_CHECK(kerr_itm);
-        CL_CHECK(clFinish(q));
 
-        /* Read back dbloss and convert to signal/mask on CPU */
+        /* Read back dbloss (blocking read on in-order queue automatically awaits kern_build + kern_itm) */
+        cl_int rerr = CL_SUCCESS;
         if (use_double) {
-            CL_CHECK(clEnqueueReadBuffer(q, d_loss, CL_TRUE, 0,
-                         (size_t)batch_count * sizeof(double), loss_buf.data(), 0, NULL, NULL));
+            rerr = clEnqueueReadBuffer(q, d_loss, CL_TRUE, 0,
+                         (size_t)batch_count * sizeof(double), loss_buf.data(), 0, NULL, NULL);
         } else {
             std::vector<float> fl(batch_count);
-            CL_CHECK(clEnqueueReadBuffer(q, d_loss, CL_TRUE, 0,
-                         (size_t)batch_count * sizeof(float), fl.data(), 0, NULL, NULL));
-            for (int i = 0; i < batch_count; i++) loss_buf[i] = (double)fl[i];
+            rerr = clEnqueueReadBuffer(q, d_loss, CL_TRUE, 0,
+                         (size_t)batch_count * sizeof(float), fl.data(), 0, NULL, NULL);
+            if (rerr == CL_SUCCESS) {
+                for (int i = 0; i < batch_count; i++) loss_buf[i] = (double)fl[i];
+            }
         }
+        if ((rerr == CL_MEM_OBJECT_ALLOCATION_FAILURE || rerr == CL_OUT_OF_RESOURCES) && batch_size > (int)local) {
+            fprintf(stderr, "warning: VRAM pressure on %s (readback), halving batch %d -> %d\n",
+                    pick.name, batch_size, batch_size / 2);
+            batch_size = (int)(((size_t)(batch_size / 2) / local) * local);
+            if (batch_size < (int)local) batch_size = (int)local;
+            alloc_batch = ((size_t)batch_size + local - 1) / local * local;
+            recreate_queue();
+            alloc_batch_buffers(alloc_batch);
+            loss_buf.resize(alloc_batch);
+            err_buf.resize(alloc_batch);
+            continue;
+        }
+        CL_CHECK(rerr);
 
         double erp_w = tx_power_w * pow(10.0, tx_gain / 10.0);
         for (int g = 0; g < batch_count; g++) {
@@ -788,8 +844,6 @@ int main(int argc, char **argv) {
     clReleaseMemObject(d_surf);
     clReleaseMemObject(d_prof);
     clReleaseMemObject(d_scratch);
-    clReleaseMemObject(d_signal);
-    clReleaseMemObject(d_mask);
     clReleaseMemObject(d_loss);
     clReleaseMemObject(d_err);
     clReleaseKernel(kern_build);

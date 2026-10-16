@@ -215,9 +215,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    size_t tile_cells = (size_t)tile_w * (size_t)tile_h;
-    std::vector<int16_t> signal(tile_cells);
-    std::vector<uint8_t> mask(tile_cells);
+    std::vector<int16_t> signal(surface.size());
+    std::vector<uint8_t> mask(surface.size());
     int covered = 0;
     int err_counts[6] = {0, 0, 0, 0, 0, 0};
     int tx_col = clamp_i((int)llround((tx_x - min_x) / resolution), 0, width - 1);
@@ -225,6 +224,7 @@ int main(int argc, char **argv) {
     unsigned hw = std::thread::hardware_concurrency();
     int worker_count = threads > 0 ? threads : (hw > 0 ? (int)hw : 1);
     worker_count = std::max(1, std::min(worker_count, tile_h));
+    worker_count = std::min(worker_count, 8);
 
     std::vector<WorkerState> states((size_t)worker_count);
     std::vector<std::thread> workers;
@@ -232,11 +232,9 @@ int main(int argc, char **argv) {
 
     auto run_rows = [&](int worker_index) {
         WorkerState &state = states[(size_t)worker_index];
-        for (int local_r = worker_index; local_r < tile_h; local_r += worker_count) {
-            int row = tile_y0 + local_r;
-            for (int local_c = 0; local_c < tile_w; local_c++) {
-                int col = tile_x0 + local_c;
-                size_t tile_idx = (size_t)local_r * (size_t)tile_w + (size_t)local_c;
+        for (int row = tile_y0 + worker_index; row < tile_y0 + tile_h; row += worker_count) {
+            for (int col = tile_x0; col < tile_x0 + tile_w; col++) {
+                size_t idx = (size_t)row * (size_t)width + (size_t)col;
                 double dbm = run_itm_path(surface, width, height, resolution,
                                           tx_col, tx_row, tx_height, col, row,
                                           rx_height, freq, tx_power_w, tx_gain,
@@ -244,9 +242,9 @@ int main(int argc, char **argv) {
                                           climate, polarization, conf, rel,
                                           state.err_counts, state.scratch);
                 int value = (int)llround(dbm * 10.0);
-                signal[tile_idx] = (int16_t)std::max(-32768, std::min(32767, value));
-                mask[tile_idx] = dbm >= rx_sensitivity ? 1 : 0;
-                if (mask[tile_idx])
+                signal[idx] = (int16_t)std::max(-32768, std::min(32767, value));
+                mask[idx] = dbm >= rx_sensitivity ? 1 : 0;
+                if (mask[idx])
                     state.covered++;
             }
         }
@@ -273,13 +271,19 @@ int main(int argc, char **argv) {
     fp = fopen((base + signal_suffix).c_str(), "wb");
     if (!fp)
         return 1;
-    fwrite(signal.data(), sizeof(int16_t), tile_cells, fp);
+    for (int row = tile_y0; row < tile_y0 + tile_h; row++) {
+        const int16_t *src = signal.data() + (size_t)row * (size_t)width + (size_t)tile_x0;
+        fwrite(src, sizeof(int16_t), (size_t)tile_w, fp);
+    }
     fclose(fp);
 
     fp = fopen((base + mask_suffix).c_str(), "wb");
     if (!fp)
         return 1;
-    fwrite(mask.data(), sizeof(uint8_t), tile_cells, fp);
+    for (int row = tile_y0; row < tile_y0 + tile_h; row++) {
+        const uint8_t *src = mask.data() + (size_t)row * (size_t)width + (size_t)tile_x0;
+        fwrite(src, sizeof(uint8_t), (size_t)tile_w, fp);
+    }
     fclose(fp);
 
     fp = fopen((base + meta_suffix).c_str(), "wb");

@@ -152,13 +152,18 @@ async function readJson<T>(url: string, init?: RequestInit): Promise<T> {
   const text = await response.text();
   try {
     return JSON.parse(text) as T;
-  } catch {
-    // Standard JSON rejects NaN, Infinity, and -Infinity, which Python's
-    // json.dumps emits by default. Replace them with null so parsing succeeds.
-    const sanitized = text
-      .replace(/([:\[,]\s*)NaN\b/g, '$1null')
-      .replace(/([:\[,]\s*)-?Infinity\b/g, '$1null');
-    return JSON.parse(sanitized) as T;
+  } catch (err) {
+    try {
+      // Standard JSON rejects NaN, Infinity, and -Infinity, which Python's
+      // json.dumps emits by default. Replace them with null so parsing succeeds.
+      const sanitized = text
+        .replace(/([:\[,\s])-?NaN\b/gi, '$1null')
+        .replace(/([:\[,\s])-?Infinity\b/gi, '$1null');
+      return JSON.parse(sanitized) as T;
+    } catch {
+      console.error(`Failed to parse JSON from ${url}:`, text.slice(0, 500));
+      throw err;
+    }
   }
 }
 

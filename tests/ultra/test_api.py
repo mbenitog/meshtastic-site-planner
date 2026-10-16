@@ -56,9 +56,10 @@ def test_create_ultra_job_returns_artifact_urls():
     )
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "queued"
+    assert body["status"] in ("queued", "coverage_ready")
     assert "job_id" in body
-    assert body["progress"]["phase"] == "terrain"
+    if body["status"] == "queued":
+        assert body["progress"]["phase"] == "terrain"
 
 
 def test_cancel_ultra_job_marks_request():

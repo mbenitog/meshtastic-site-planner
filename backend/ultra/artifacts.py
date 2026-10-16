@@ -14,10 +14,13 @@ from .surface import SurfaceGrid
 
 def sanitize_for_json(data: Any) -> Any:
     """Recursively convert NaN and Infinity floats to None (JSON null)."""
-    if isinstance(data, float):
-        if math.isnan(data) or math.isinf(data):
+    if isinstance(data, (float, np.floating)):
+        f_val = float(data)
+        if math.isnan(f_val) or math.isinf(f_val):
             return None
-        return data
+        return f_val
+    if isinstance(data, (int, np.integer)):
+        return int(data)
     if isinstance(data, dict):
         return {k: sanitize_for_json(v) for k, v in data.items()}
     if isinstance(data, (list, tuple)):

@@ -313,12 +313,10 @@ def get_optimal_gpu_slots(
             dev_workers = max(1, min(dev_workers, int(env_max_w_per_gpu)))
         dev_workers = min(dev_workers, max(1, total_tiles))
 
-        # Dynamically compute safe, maximal profile budget for each worker:
+        # Dynamically compute maximal profile budget for each worker bounded by driver max allocation:
         vram_per_worker_mb = vram_usable_mb // dev_workers
         available_profile_mb = vram_per_worker_mb - fixed_overhead_per_worker
-        # Cap single buffer allocation to 65% of max_alloc_mb to prevent driver heap fragmentation
-        safe_max_alloc_mb = int(max_alloc_mb * 0.65) if max_alloc_mb else 2048
-        profile_budget_mb = min(safe_max_alloc_mb, max(min_profile_budget_mb, available_profile_mb))
+        profile_budget_mb = min(max_alloc_mb, max(min_profile_budget_mb, available_profile_mb))
         if user_budget is not None:
             profile_budget_mb = user_budget
 

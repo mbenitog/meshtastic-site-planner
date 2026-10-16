@@ -1175,7 +1175,7 @@ const useStore = defineStore('store', {
         const request = {
           lat: this.splatParams.transmitter.tx_lat,
           lon: this.splatParams.transmitter.tx_lon,
-          radius: this.splatParams.simulation.simulation_extent,
+          radius: this.splatParams.simulation.simulation_extent * 1000,
         };
         const cropped = cropToRadius(result, request.lat, request.lon, request.radius);
         const siteParams = cloneObject(this.splatParams);

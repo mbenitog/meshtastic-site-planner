@@ -455,11 +455,11 @@ int main(int argc, char **argv) {
     size_t bytes_per_item = (size_t)(stride_prof + D1THX_SCRATCH_LEN + 2) * elem_size;
     int batch_size = (int)(mem_budget / bytes_per_item);
 
-    /* OpenCL continuous allocation safety:
-       Never request a single buffer exceeding 65% of CL_DEVICE_MAX_MEM_ALLOC_SIZE
-       to prevent memory fragmentation in the driver's virtual memory manager. */
+    /* Bound batch_size so single profile buffer never exceeds driver max_alloc.
+       Uses 90% of max_alloc to provide comfortable headroom for driver metadata
+       while maximizing GPU batch throughput. */
     if (max_alloc > 0) {
-        size_t safe_max_alloc = (size_t)((double)max_alloc * 0.65);
+        size_t safe_max_alloc = (size_t)((double)max_alloc * 0.90);
         int max_prof_items = (int)(safe_max_alloc / ((size_t)stride_prof * elem_size));
         if (max_prof_items > 0 && batch_size > max_prof_items) {
             batch_size = max_prof_items;
@@ -467,18 +467,17 @@ int main(int argc, char **argv) {
     }
 
     /* Compute hardware saturation target based on device compute units (SMs).
-       To hide memory latency and saturate all execution pipelines without
-       unnecessarily bloating VRAM:
-       - 512 work items per CU (16 warps/CU) provides 100% ALU occupancy for Longley-Rice.
-       - A GPU with 28 CUs (RTX 3060) reaches peak saturation at 28 * 512 = 14,336 work items.
-       - A GPU with 128 CUs (RTX 4090) scales to 128 * 512 = 65,536 work items.
-       - Minimum batch size floor is 4096 (128 warps), ensuring even small GPUs are saturated. */
+       1,024 work items per SM (32 warps/SM) achieves peak hardware saturation
+       and latency hiding for Longley-Rice under register pressure.
+       High-end GPUs (e.g. RTX 4090 with 128 SMs) scale up to 131k work items,
+       while smaller GPUs (RTX 3060 with 28 SMs) scale to ~28k items,
+       automatically fitting their hardware profile and VRAM budget. */
     cl_uint compute_units = 1;
     clGetDeviceInfo(pick.device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, NULL);
     if (compute_units < 1) compute_units = 1;
 
-    int cu_saturation_batch = (int)compute_units * 512;
-    int max_batch_limit = std::max(4096, cu_saturation_batch);
+    int cu_saturation_batch = (int)compute_units * 1024;
+    int max_batch_limit = std::max(16384, cu_saturation_batch);
     const char *env_max_batch = getenv("ULTRA_MAX_BATCH_SIZE");
     if (env_max_batch) {
         int mb = atoi(env_max_batch);

@@ -1167,7 +1167,7 @@ const useStore = defineStore('store', {
       }
       const baseUrl = this.splatParams.simulation.ultra_backend_url || defaultUltraBackendUrl();
       this.simulationState = 'simulating';
-      this.errorMessage = null;
+      this.errorMessage = '';
       try {
         const result = await loadUltraJobResult(baseUrl, idToLoad, undefined, (p) => {
           this.progress = p;
@@ -1180,24 +1180,32 @@ const useStore = defineStore('store', {
         const cropped = cropToRadius(result, request.lat, request.lon, request.radius);
         const siteParams = cloneObject(this.splatParams);
         const id = generateUUID();
-        const site: SiteCoverage = {
-          id,
-          name: siteParams.transmitter.name || 'Ultra Site',
-          lat: request.lat,
-          lon: request.lon,
-          result: cropped,
+        const stats = coverageStats(
+          cropped,
+          request.lat,
+          request.lon,
+          siteParams.receiver.rx_sensitivity
+        );
+        const site: Site = {
           params: siteParams,
-          color: nextSiteColor(this.sites.length),
+          id,
+          result: cropped,
           visible: true,
-          opacity: 0.7,
+          stats,
+          artifacts: (result as UltraBackendResult).artifacts,
+          surfaceMode: (result as UltraBackendResult).surfaceMode,
+          sourceCounts: (result as UltraBackendResult).sourceCounts,
         };
-        this.sites.push(site);
-        this.activeSiteId = id;
+        this.localSites.push(site);
         this.lastUltraJobId = idToLoad;
 
+        this.cancelPlaceOnMap();
+        this.clearDraftMarker();
         if (map) {
-          const elevText = this.elevationProbe?.ground_m
-            ? `${Math.round(this.elevationProbe.ground_m + siteParams.transmitter.tx_alt)} m`
+          const elevText = this.elevationProbe?.available
+            ? ((this.elevationProbe.structure_m ?? 0) > 0.5
+                ? `🏢 ${this.elevationProbe.surface_m}m`
+                : `📍 ${this.elevationProbe.surface_m}m`)
             : undefined;
           const popup = new maplibregl.Popup({ closeButton: true, offset: 46 })
             .setDOMContent(buildSitePopup(site));
@@ -1217,7 +1225,9 @@ const useStore = defineStore('store', {
         this.errorMessage = error instanceof Error ? error.message : String(error);
         this.simulationState = 'failed';
       } finally {
+        this.currentUltraJobId = '';
         this.progress = null;
+        abortController = undefined;
       }
     }
   }

@@ -421,22 +421,74 @@ int main(int argc, char **argv) {
     cl_command_queue q = clCreateCommandQueue(ctx, pick.device, 0, &e);
     CL_CHECK(e);
 
-    std::vector<char> ksrc = load_file(kernel_path);
-    const char *srcs[1] = { ksrc.data() };
-    size_t lens[1] = { ksrc.size() - 1 };
-    cl_program prog = clCreateProgramWithSource(ctx, 1, srcs, lens, &e);
-    CL_CHECK(e);
     const char *build_opts = use_double ? "-DUSE_DOUBLE" : "";
-    e = clBuildProgram(prog, 1, &pick.device, build_opts, NULL, NULL);
-    if (e != CL_SUCCESS) {
-        fprintf(stderr, "kernel build failed: %s\n", cl_err(e));
-        size_t loglen = 0;
-        clGetProgramBuildInfo(prog, pick.device, CL_PROGRAM_BUILD_LOG, 0, NULL, &loglen);
-        std::vector<char> log(loglen + 1);
-        clGetProgramBuildInfo(prog, pick.device, CL_PROGRAM_BUILD_LOG, loglen, log.data(), NULL);
-        log[loglen] = '\0';
-        fprintf(stderr, "---- build log ----\n%s\n------------------\n", log.data());
-        return 1;
+    cl_program prog = NULL;
+
+    /* Cache precompiled device binary in /tmp to eliminate JIT compilation
+     * and driver shader-cache lock contention across concurrent tile subprocesses. */
+    char bin_path[256];
+    snprintf(bin_path, sizeof(bin_path), "/tmp/ultra_cl_%s_%s.bin",
+             use_double ? "fp64" : "fp32", pick.name);
+    for (char *p = bin_path; *p; p++) {
+        if (*p == ' ' || *p == '/' || *p == ':' || *p == '(' || *p == ')') *p = '_';
+    }
+
+    FILE *fbin = fopen(bin_path, "rb");
+    if (fbin) {
+        fseek(fbin, 0, SEEK_END);
+        long bsz_l = ftell(fbin);
+        fseek(fbin, 0, SEEK_SET);
+        if (bsz_l > 0) {
+            size_t bsz = (size_t)bsz_l;
+            std::vector<unsigned char> bdata(bsz);
+            if (fread(bdata.data(), 1, bsz, fbin) == bsz) {
+                const unsigned char *bptr = bdata.data();
+                cl_int bstatus = CL_SUCCESS;
+                prog = clCreateProgramWithBinary(ctx, 1, &pick.device, &bsz, &bptr, &bstatus, &e);
+                if (e == CL_SUCCESS && bstatus == CL_SUCCESS && prog) {
+                    e = clBuildProgram(prog, 1, &pick.device, build_opts, NULL, NULL);
+                    if (e != CL_SUCCESS) {
+                        clReleaseProgram(prog);
+                        prog = NULL;
+                    }
+                } else if (prog) {
+                    clReleaseProgram(prog);
+                    prog = NULL;
+                }
+            }
+        }
+        fclose(fbin);
+    }
+
+    if (!prog) {
+        std::vector<char> ksrc = load_file(kernel_path);
+        const char *srcs[1] = { ksrc.data() };
+        size_t lens[1] = { ksrc.size() - 1 };
+        prog = clCreateProgramWithSource(ctx, 1, srcs, lens, &e);
+        CL_CHECK(e);
+        e = clBuildProgram(prog, 1, &pick.device, build_opts, NULL, NULL);
+        if (e != CL_SUCCESS) {
+            fprintf(stderr, "kernel build failed: %s\n", cl_err(e));
+            size_t loglen = 0;
+            clGetProgramBuildInfo(prog, pick.device, CL_PROGRAM_BUILD_LOG, 0, NULL, &loglen);
+            std::vector<char> log(loglen + 1);
+            clGetProgramBuildInfo(prog, pick.device, CL_PROGRAM_BUILD_LOG, loglen, log.data(), NULL);
+            log[loglen] = '\0';
+            fprintf(stderr, "---- build log ----\n%s\n------------------\n", log.data());
+            return 1;
+        }
+        size_t bsz = 0;
+        if (clGetProgramInfo(prog, CL_PROGRAM_BINARY_SIZES, sizeof(size_t), &bsz, NULL) == CL_SUCCESS && bsz > 0) {
+            std::vector<unsigned char> bdata(bsz);
+            unsigned char *bptr = bdata.data();
+            if (clGetProgramInfo(prog, CL_PROGRAM_BINARIES, sizeof(unsigned char*), &bptr, NULL) == CL_SUCCESS) {
+                FILE *fw = fopen(bin_path, "wb");
+                if (fw) {
+                    fwrite(bdata.data(), 1, bsz, fw);
+                    fclose(fw);
+                }
+            }
+        }
     }
     cl_kernel kern_build = clCreateKernel(prog, "build_profiles_kernel", &e);
     CL_CHECK(e);
@@ -677,10 +729,8 @@ int main(int argc, char **argv) {
                 dst[1] = dist / segs;
                 for (int i = 0; i <= segs; i++) {
                     double t = (double)i / (double)segs;
-                    int gc = clamp_i((int)llround((double)tx_col + (double)dx * t), 0, width - 1);
-                    int gr = clamp_i((int)llround((double)tx_row + (double)dy * t), 0, height - 1);
-                    int c = clamp_i(gc - crop_x0, 0, crop_w - 1);
-                    int r = clamp_i(gr - crop_y0, 0, crop_h - 1);
+                    int c = clamp_i((int)llround((double)tx_col + (double)dx * t) - crop_x0, 0, crop_w - 1);
+                    int r = clamp_i((int)llround((double)tx_row + (double)dy * t) - crop_y0, 0, crop_h - 1);
                     dst[i + 2] = (double)surface[(size_t)r * crop_w + c];
                 }
                 double pad = dst[segs + 2];

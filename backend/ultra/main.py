@@ -313,10 +313,13 @@ def get_optimal_gpu_slots(
             dev_workers = max(1, min(dev_workers, int(env_max_w_per_gpu)))
         dev_workers = min(dev_workers, max(1, total_tiles))
 
-        # Dynamically compute maximal profile budget for each worker bounded by driver max allocation:
+        # Hardware-proportional profile budget (scales with SMs and L2 cache,
+        # preventing driver heap compaction and VRAM bus saturation):
+        ideal_profile_budget_mb = min(max_alloc_mb, max(512, int(compute_units * 16)))
+
         vram_per_worker_mb = vram_usable_mb // dev_workers
         available_profile_mb = vram_per_worker_mb - fixed_overhead_per_worker
-        profile_budget_mb = min(max_alloc_mb, max(min_profile_budget_mb, available_profile_mb))
+        profile_budget_mb = min(ideal_profile_budget_mb, max(min_profile_budget_mb, available_profile_mb))
         if user_budget is not None:
             profile_budget_mb = user_budget
 
@@ -959,6 +962,15 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
             _advance_tile_progress_throttled(job_id, total, cells_per_tile=avg_cells_per_tile)
         else:
             pending_tiles.append(tile)
+
+    # Sort pending tiles by distance from TX (center-out radial ordering):
+    # Inner tiles have much shorter ray paths, completing rapidly and delivering
+    # immediate map coverage and warm cache performance outward.
+    tx_col_approx = clamp_i(int(round((tx_x - artifact.min_x) / artifact.resolution_m)), 0, artifact.width - 1)
+    tx_row_approx = clamp_i(int(round((artifact.max_y - tx_y) / artifact.resolution_m)), 0, artifact.height - 1)
+    pending_tiles.sort(
+        key=lambda t: (t.x0 + t.width / 2.0 - tx_col_approx) ** 2 + (t.y0 + t.height / 2.0 - tx_row_approx) ** 2
+    )
 
     is_gpu = (binary.name == "ultra_cli_opencl" and bool(opencl_kernel))
     surf_bytes_mb = int((artifact.width * artifact.height * 2) / (1024 * 1024))

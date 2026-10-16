@@ -1058,10 +1058,8 @@ static void build_profile_cl(__global const short* surface, int surf_w, int surf
     elev[1] = dist / (real_t)segments;
     for (int i = 0; i <= segments; i++) {
         real_t t = (real_t)i / (real_t)segments;
-        int g_col = imin(imax((int)round((real_t)tx_col + (real_t)dx * t), 0), full_w - 1);
-        int g_row = imin(imax((int)round((real_t)tx_row + (real_t)dy * t), 0), full_h - 1);
-        int col = imin(imax(g_col - surf_x0, 0), surf_w - 1);
-        int row = imin(imax(g_row - surf_y0, 0), surf_h - 1);
+        int col = imin(imax((int)round((real_t)tx_col + (real_t)dx * t) - surf_x0, 0), surf_w - 1);
+        int row = imin(imax((int)round((real_t)tx_row + (real_t)dy * t) - surf_y0, 0), surf_h - 1);
         elev[i + 2] = (real_t)surface[(size_t)row * (size_t)surf_w + (size_t)col];
     }
     for (int i = segments + 3; i < segments + 16 && i < stride; i++)

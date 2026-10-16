@@ -60,297 +60,15 @@ jobs: dict[str, dict] = {}
 JOB_ROOT = Path(".cache/ultra-jobs")
 TILE_MAX_CELLS = 250_000
 SINGLE_TILE_CELL_THRESHOLD = 1_000_000
-_cached_gpu_tile_cells: int | None = None
+def _resolve_cpu_binary() -> Path:
+    binary = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli")).resolve()
+    if binary.exists():
+        return binary
+    for cand in [Path("/usr/local/bin/ultra_cli"), Path("engine/build/ultra_cli")]:
+        if cand.exists():
+            return cand.resolve()
+    return binary
 
-
-_cached_gpu_info: dict | None = None
-_gpu_probed: bool = False
-
-
-def _probe_gpu(binary_path: Path) -> dict | None:
-    global _cached_gpu_info, _gpu_probed
-    if _gpu_probed:
-        return _cached_gpu_info
-    try:
-        import subprocess
-        proc = subprocess.run([str(binary_path), "--probe"], capture_output=True, text=True, timeout=5)
-        _gpu_probed = True
-        if proc.returncode == 0:
-            _cached_gpu_info = json.loads(proc.stdout)
-            return _cached_gpu_info
-    except Exception as exc:
-        _gpu_probed = True
-        logger.warning("Could not probe OpenCL device: %s", exc)
-    return None
-
-
-def _resolve_native_binary() -> tuple[Path, str]:
-    default_bin = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli")).resolve()
-
-    # Find CPU binary fallback candidate
-    cpu_candidates = [
-        default_bin if default_bin.name != "ultra_cli_opencl" else default_bin.with_name("ultra_cli"),
-        default_bin.with_name("ultra_cli"),
-        Path("/usr/local/bin/ultra_cli"),
-        Path("engine/build/ultra_cli"),
-    ]
-    resolved_cpu = None
-    for cand in cpu_candidates:
-        if cand.name != "ultra_cli_opencl" and cand.exists():
-            resolved_cpu = cand.resolve()
-            break
-    if not resolved_cpu:
-        resolved_cpu = default_bin
-
-    opencl_kernel = os.environ.get("ULTRA_OPENCL_KERNEL", "")
-    if not opencl_kernel:
-        for cand in [Path("/usr/local/share/ultra/itm_kernel.cl"), Path("engine/opencl/itm_kernel.cl")]:
-            if cand.exists():
-                opencl_kernel = str(cand.resolve())
-                break
-
-    if opencl_kernel:
-        candidates = [
-            default_bin if default_bin.name == "ultra_cli_opencl" else default_bin.with_name("ultra_cli_opencl"),
-            Path("/usr/local/bin/ultra_cli_opencl"),
-            Path("engine/build/ultra_cli_opencl"),
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                probe = _probe_gpu(candidate)
-                if probe and _resolve_opencl_devices(probe):
-                    return candidate.resolve(), opencl_kernel
-                else:
-                    logger.info("ℹ️ OpenCL binary exists (%s), but no active GPU platforms/devices found. Using CPU runner.", candidate)
-                break
-
-    return resolved_cpu, ""
-
-
-def _resolve_opencl_devices(probe_info: dict | None) -> list[dict]:
-    """Resolve the list of OpenCL devices to use, honoring ULTRA_OPENCL_DEVICES
-    and ULTRA_OPENCL_DEVICE, and filtering out CPUs and integrated graphics
-    unless explicitly requested."""
-    if not probe_info:
-        return []
-    all_devs = probe_info.get("devices", [])
-    if not all_devs:
-        if "device" in probe_info:
-            return [{
-                "platform": probe_info.get("platform", 0),
-                "device": probe_info.get("device_index", 0),
-                "name": probe_info.get("device", "GPU"),
-                "type": probe_info.get("type", "GPU"),
-                "vram_mb": probe_info.get("vram_mb", 0),
-                "max_alloc_mb": probe_info.get("max_alloc_mb", 2048),
-            }]
-        return []
-
-    env_devices = os.environ.get("ULTRA_OPENCL_DEVICES")
-    env_single = os.environ.get("ULTRA_OPENCL_DEVICE")
-
-    # If user explicitly specifies ULTRA_OPENCL_DEVICES
-    if env_devices:
-        env_val = env_devices.strip()
-        if env_val.lower() in ("all", "all_gpu", "gpus"):
-            return [d for d in all_devs if d.get("type") == "GPU"]
-        if env_val.lower() == "all_devices":
-            return all_devs
-
-        tokens = [t.strip() for t in env_val.split(",") if t.strip()]
-        selected: list[dict] = []
-        for token in tokens:
-            if token.isdigit():
-                idx = int(token)
-                matched = [d for d in all_devs if d["device"] == idx]
-                selected.extend(matched)
-            else:
-                matched = [d for d in all_devs if token.lower() in d["name"].lower()]
-                selected.extend(matched)
-        if selected:
-            seen = set()
-            dedup = []
-            for d in selected:
-                key = (d["platform"], d["device"])
-                if key not in seen:
-                    seen.add(key)
-                    dedup.append(d)
-            return dedup
-
-    # Legacy single device (e.g. ULTRA_OPENCL_DEVICE=1)
-    if env_single is not None:
-        try:
-            s_idx = int(env_single)
-            matched = [d for d in all_devs if d["device"] == s_idx]
-            if matched:
-                return matched
-        except ValueError:
-            pass
-
-    # Automatic smart filtering:
-    # 1. Filter out CPU devices
-    gpu_devs = [d for d in all_devs if d.get("type") == "GPU"]
-    if not gpu_devs:
-        return [all_devs[0]]
-
-    # 2. Check for discrete/dedicated GPUs (ignore Intel integrated graphics if discrete GPUs exist)
-    def is_discrete(name: str) -> bool:
-        n = name.lower()
-        if any(igpu in n for igpu in ("intel(r) hd", "intel(r) uhd", "intel(r) iris", "integrated graphics")):
-            return False
-        if any(brand in n for brand in ("nvidia", "geforce", "rtx", "gtx", "quadro", "tesla", "amd", "radeon", "rx ")):
-            return True
-        return False
-
-    discrete_devs = [d for d in gpu_devs if is_discrete(d["name"])]
-    if discrete_devs:
-        return discrete_devs
-
-    return gpu_devs
-
-
-def get_optimal_tile_cells(binary_path: Path, opencl_kernel: str) -> int:
-    env_override = os.environ.get("ULTRA_TILE_MAX_CELLS")
-    if env_override:
-        return max(50_000, int(env_override))
-    if not opencl_kernel or binary_path.name != "ultra_cli_opencl":
-        return TILE_MAX_CELLS
-    info = _probe_gpu(binary_path)
-    if not info:
-        return TILE_MAX_CELLS
-    devices = _resolve_opencl_devices(info)
-    max_vram = max((d.get("vram_mb", 0) for d in devices), default=info.get("vram_mb", 0))
-    if max_vram >= 12000:
-        tile_cells = 4_000_000
-    elif max_vram >= 6000:
-        tile_cells = 2_000_000
-    elif max_vram >= 3000:
-        tile_cells = 1_000_000
-    elif max_vram >= 1500:
-        tile_cells = 500_000
-    else:
-        tile_cells = 250_000
-    dev_names = ", ".join(d.get("name", "GPU") for d in devices) if devices else info.get("device", "GPU")
-    logger.info("🎮 [GPU Auto-scale] Active: %s (max %d MB VRAM) -> optimal tile size: %d cells",
-                dev_names, max_vram, tile_cells)
-    return tile_cells
-
-
-def get_optimal_gpu_slots(
-    binary_path: Path,
-    opencl_kernel: str,
-    total_tiles: int,
-    cpu_count: int,
-    surf_bytes_mb: int = 0,
-) -> list[dict]:
-    """Calculate per-device concurrency slots and VRAM profile budgets across
-    all active OpenCL GPUs."""
-    if not opencl_kernel or binary_path.name != "ultra_cli_opencl":
-        return []
-    info = _probe_gpu(binary_path)
-    if not info:
-        return []
-
-    devices = _resolve_opencl_devices(info)
-    if not devices:
-        return []
-
-    env_workers = os.environ.get("ULTRA_TILE_WORKERS")
-    forced_total_workers = int(env_workers) if env_workers is not None else None
-    env_budget = os.environ.get("ULTRA_MEM_BUDGET_MB")
-    user_budget = int(env_budget) if env_budget else None
-
-    slots: list[dict] = []
-    min_profile_budget_mb = 256
-
-    env_max_w_per_gpu = os.environ.get("ULTRA_MAX_WORKERS_PER_GPU")
-
-    dev_slots: list[list[dict]] = []
-    for d in devices:
-        compute_units = d.get("compute_units", 32)
-        vram_mb = d.get("vram_mb", 0)
-        max_alloc_mb = d.get("max_alloc_mb", 2048)
-        if vram_mb <= 0:
-            continue
-
-        # Usable VRAM: reserve 15% (or at least 384 MB) for OS display manager, X11/Wayland, and driver heap
-        vram_usable_mb = max(512, int(vram_mb * 0.85) - 384)
-
-        # Real per-worker memory footprint:
-        # - Surface grid buffer in int16: surf_bytes_mb (e.g. 1098 MB at 30km, 763 MB at 25km)
-        # - OpenCL context + JIT compiled program + CUDA runtime heap: ~384 MB
-        # - Output signal & mask buffers + dynamic command scratch: ~128 MB
-        # Total fixed overhead before profile buffer = surf_bytes_mb + 512 MB
-        fixed_overhead_per_worker = surf_bytes_mb + 512
-        min_worker_footprint = fixed_overhead_per_worker + min_profile_budget_mb
-
-        # Maximum workers that physically fit in usable VRAM without memory allocation failure
-        max_workers_by_vram = max(1, vram_usable_mb // max(1, min_worker_footprint))
-
-        # Hardware saturation: each worker requires sufficient Compute Units (SMs)
-        # to achieve high execution occupancy without warp-scheduling contention.
-        # Giving at least 14 CUs per worker prevents performance degradation.
-        max_workers_by_cu = max(1, compute_units // 14)
-
-        dev_workers = max(1, min(max_workers_by_vram, max_workers_by_cu))
-        if env_max_w_per_gpu:
-            dev_workers = max(1, min(dev_workers, int(env_max_w_per_gpu)))
-        dev_workers = min(dev_workers, max(1, total_tiles))
-
-        # Dynamically compute safe, maximal profile budget for each worker:
-        vram_per_worker_mb = vram_usable_mb // dev_workers
-        available_profile_mb = vram_per_worker_mb - fixed_overhead_per_worker
-        profile_budget_mb = min(max_alloc_mb, max(min_profile_budget_mb, available_profile_mb))
-        if user_budget is not None:
-            profile_budget_mb = user_budget
-
-        logger.info("  ↳ [GPU %d:%d] %s (%d MB VRAM, %d CUs) -> %d workers (~%d MB profile/w, ~%d MB total/w)",
-                    d["platform"], d["device"], d["name"], vram_mb, compute_units, dev_workers, profile_budget_mb,
-                    fixed_overhead_per_worker + profile_budget_mb)
-
-        d_list = []
-        for _ in range(dev_workers):
-            d_list.append({
-                "platform": d["platform"],
-                "device": d["device"],
-                "budget_mb": profile_budget_mb,
-                "vram_mb": vram_mb,
-                "name": d["name"],
-            })
-        dev_slots.append(d_list)
-
-    if not dev_slots:
-        return []
-
-    # Interleave slots across devices: round-robin [GPU0, GPU1, GPU0, GPU1, ...]
-    interleaved_slots: list[dict] = []
-    max_count = max(len(s) for s in dev_slots)
-    for i in range(max_count):
-        for s in dev_slots:
-            if i < len(s):
-                interleaved_slots.append(s[i])
-    slots = interleaved_slots
-
-    if forced_total_workers is not None:
-        target_count = min(max(1, forced_total_workers), max(1, total_tiles))
-        if len(slots) < target_count:
-            extra = []
-            while len(slots) + len(extra) < target_count:
-                extra.append(slots[(len(slots) + len(extra)) % len(slots)])
-            slots.extend(extra)
-        elif len(slots) > target_count:
-            slots = slots[:target_count]
-
-    slots = slots[:max(1, total_tiles)]
-
-    if len(devices) > 1:
-        logger.info("🎮 [Multi-GPU] Total concurrency: %d workers distributed across %d GPUs",
-                    len(slots), len(devices))
-    else:
-        logger.info("🎮 [GPU Auto-scale] Total concurrency: %d workers on %s",
-                    len(slots), devices[0]["name"])
-
-    return slots
 
 # Cross-process registry of in-flight C++ subprocesses (ultra_cli) keyed by
 # job_id. Backed by a multiprocessing.Manager so that worker processes
@@ -722,16 +440,14 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
         job["status"] = "running_native"
         job["message"] = "Running ITM/Longley-Rice over measured projected-grid terrain in tiles."
         set_progress(job, "compute", 0.4)
-        binary, opencl_kernel = _resolve_native_binary()
-        tile_max_cells = get_optimal_tile_cells(binary, opencl_kernel)
-        tiles = plan_tiles(artifact.width, artifact.height, tile_max_cells)
+        tiles = plan_tiles(artifact.width, artifact.height, TILE_MAX_CELLS)
         job["tiles"] = {
             "count": len(tiles),
             "completed": 0,
         }
         persist_job(job_id, job)
         logger.info("⏳ [Job %s] Phase 2/3: Computing ITM RF coverage across %d tiles (max %d cells/tile)...",
-                    job_id, len(tiles), tile_max_cells)
+                    job_id, len(tiles), TILE_MAX_CELLS)
 
         t_compute = time.perf_counter()
         native_result = _run_tiles_with_progress(
@@ -804,23 +520,8 @@ def _run_one_tile(
     threads: int,
     job_id: str,
     pid_registry: dict,
-    opencl_kernel: str = "",
-    mem_budget_mb: int | None = None,
-    opencl_platform: int | None = None,
-    opencl_device: int | None = None,
 ) -> None:
-    """ProcessPoolExecutor worker: build the per-tile command and run it.
-
-    Module-level (not a closure) so the executor can pickle it across
-    process boundaries. All inputs are plain picklable types; the dataclass
-    shapes are reconstructed from ``asdict(...)`` snapshots.
-
-    The worker's C++ child PID is registered in ``pid_registry[job_id]``
-    (a Manager list proxy) so the main process can SIGTERM/SIGKILL it on
-    cancel. We use ``Popen`` + ``communicate(timeout=...)`` instead of
-    ``subprocess.run`` so the cancel endpoint can interrupt the in-flight
-    child even though the parent worker is still blocked.
-    """
+    """ProcessPoolExecutor worker: build the per-tile command and run it."""
     import os
     import subprocess
     from pathlib import Path
@@ -828,11 +529,6 @@ def _run_one_tile(
     from .tiler import TileSpec
     from .runner import _build_cmd
 
-    # Check cancel before spawning a subprocess. Otherwise a worker that
-    # gets a fresh task from the executor queue (after the original 4
-    # tasks were SIGTERM'd) would spawn a new ultra_cli that escapes the
-    # registry entirely. The check is also done after communicate()
-    # returns, but the pre-check short-circuits the spawn.
     if is_cancel_requested(job_id):
         return
 
@@ -847,18 +543,9 @@ def _run_one_tile(
         tx_y,
         Path(out_prefix),
         threads=threads,
-        opencl_kernel=opencl_kernel,
     )
-    env = os.environ.copy()
-    if mem_budget_mb is not None:
-        env["ULTRA_MEM_BUDGET_MB"] = str(mem_budget_mb)
-    if opencl_platform is not None:
-        env["ULTRA_OPENCL_PLATFORM"] = str(opencl_platform)
-    if opencl_device is not None:
-        env["ULTRA_OPENCL_DEVICE"] = str(opencl_device)
     proc = subprocess.Popen(
         cmd,
-        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -873,11 +560,6 @@ def _run_one_tile(
             stdout, stderr = proc.communicate()
             raise
         if proc.returncode != 0:
-            # If cancel was requested, the C++ child was SIGTERM'd by the
-            # main process via _terminate_job_subprocesses. The negative
-            # returncode is the signal number, not a real failure. Return
-            # normally so the outer executor loop's is_cancel_requested
-            # check produces the "cancelled" status instead of "failed".
             if is_cancel_requested(job_id):
                 return
             err_msg = (stderr or stdout or f"exit status {proc.returncode}").strip()
@@ -890,28 +572,12 @@ def _run_one_tile(
 
 
 def _run_tiles_with_progress(job_id, artifact, request, tiles):
-    """Run the tiled native runner, persisting tile-level progress into the
-    in-memory job after each completed tile so the polling client sees a
-    live fraction.
-
-    Picks one of two paths based on grid size:
-
-    * Single-process path (``workers == 1``): one subprocess per tile, all
-      cores available to the C++ runner via ``--threads cpu_count``. Used for
-      small grids (under :data:`SINGLE_TILE_CELL_THRESHOLD` cells or a single
-      pending tile) where the per-process startup cost would dominate.
-    * Multi-process path: :class:`ProcessPoolExecutor` fans the tiles out
-      across ``min(cpu_count, len(pending_tiles))`` workers, with each
-      subprocess sized to ``max(1, cpu_count // workers)`` threads so the
-      total threads across workers stays close to ``cpu_count`` (no
-      oversubscription).
-    """
     import os
     import subprocess
     from pathlib import Path
-    from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
+    from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
-    binary, opencl_kernel = _resolve_native_binary()
+    binary = _resolve_cpu_binary()
     if not binary.exists():
         from .runner import NativeRunResult
         return NativeRunResult(
@@ -920,8 +586,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
             message=f"native ultra runner not found at {binary}; run engine/build_native.sh",
         )
 
-    logger.info("⚡ [Job %s] Runner selected: %s (OpenCL Kernel: %s)",
-                job_id, binary.name, opencl_kernel or "none")
+    logger.info("⚡ [Job %s] Runner selected: %s (CPU multi-threaded)", job_id, binary.name)
 
     out_dir = job_dir(job_id).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -944,28 +609,15 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
         else:
             pending_tiles.append(tile)
 
-    is_gpu = (binary.name == "ultra_cli_opencl" and bool(opencl_kernel))
-    surf_bytes_mb = int((artifact.width * artifact.height * 2) / (1024 * 1024))
-    gpu_slots = get_optimal_gpu_slots(
-        binary, opencl_kernel, len(pending_tiles), cpu_count, surf_bytes_mb=surf_bytes_mb
-    ) if is_gpu else []
-
     if total_cells <= SINGLE_TILE_CELL_THRESHOLD or len(pending_tiles) <= 1:
         workers = 1
-        threads_per_call = 1 if is_gpu else cpu_count
-        active_slots = gpu_slots[:1] if gpu_slots else []
+        threads_per_call = cpu_count
     else:
-        if gpu_slots:
-            workers = len(gpu_slots)
-            threads_per_call = 1
-            active_slots = gpu_slots
-        else:
-            workers = min(cpu_count, max(1, len(pending_tiles)))
-            env_override = os.environ.get("ULTRA_TILE_WORKERS")
-            if env_override is not None:
-                workers = min(max(1, int(env_override)), max(1, len(pending_tiles)))
-            threads_per_call = max(1, cpu_count // workers)
-            active_slots = []
+        workers = min(cpu_count, max(1, len(pending_tiles)))
+        env_override = os.environ.get("ULTRA_TILE_WORKERS")
+        if env_override is not None:
+            workers = min(max(1, int(env_override)), max(1, len(pending_tiles)))
+        threads_per_call = max(1, cpu_count // workers)
 
     job = jobs.get(job_id)
     if job is not None:
@@ -984,20 +636,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
     registry = _ensure_pids_registry()
     job_pid_list = registry.setdefault(job_id, _active_pids_manager.list())
 
-    cpu_binary_candidate = Path(binary).with_name("ultra_cli")
-    if cpu_binary_candidate.exists():
-        cpu_binary = cpu_binary_candidate
-    elif Path("/usr/local/bin/ultra_cli").exists():
-        cpu_binary = Path("/usr/local/bin/ultra_cli")
-    elif Path("engine/build/ultra_cli").exists():
-        cpu_binary = Path("engine/build/ultra_cli")
-    else:
-        cpu_binary = Path(binary)
-
     if workers == 1:
-        single_bin = binary if active_slots else cpu_binary
-        single_kernel = opencl_kernel if active_slots else ""
-
         for tile in pending_tiles:
             if is_cancel_requested(job_id):
                 return NativeRunResult(
@@ -1006,7 +645,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                     message="Ultra job cancelled during tiled native execution.",
                 )
             cmd = _build_cmd(
-                single_bin,
+                binary,
                 artifact,
                 tile,
                 request,
@@ -1014,20 +653,9 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                 tx_y,
                 out_prefix,
                 threads=threads_per_call,
-                opencl_kernel=single_kernel,
             )
-            slot = active_slots[0] if active_slots else None
-            env = os.environ.copy()
-            if slot:
-                if slot.get("budget_mb"):
-                    env["ULTRA_MEM_BUDGET_MB"] = str(slot["budget_mb"])
-                if slot.get("platform") is not None:
-                    env["ULTRA_OPENCL_PLATFORM"] = str(slot["platform"])
-                if slot.get("device") is not None:
-                    env["ULTRA_OPENCL_DEVICE"] = str(slot["device"])
             proc = subprocess.Popen(
                 cmd,
-                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -1065,64 +693,26 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
             _advance_tile_progress_throttled(job_id, total, cells_per_tile=avg_cells_per_tile)
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            slots_by_vram = sorted(active_slots, key=lambda s: s.get("vram_mb", 0), reverse=True) if active_slots else []
-            fallback_slot = slots_by_vram[0] if slots_by_vram else (active_slots[0] if active_slots else None)
-
             pending_queue: list[TileSpec] = list(pending_tiles)
             tile_attempts: dict[tuple[int, int], int] = {}
-            in_flight: dict[Any, tuple[TileSpec, dict | None, int]] = {}
-            slot_idx = 0
+            in_flight: dict[Any, tuple[TileSpec, int]] = {}
 
             def _submit_tile(tile: TileSpec, attempt: int) -> None:
-                nonlocal slot_idx
-                if attempt == 0 and active_slots:
-                    slot = active_slots[slot_idx % len(active_slots)]
-                    slot_idx += 1
-                    target_bin = str(binary)
-                    target_kernel = opencl_kernel
-                    budget = slot["budget_mb"] if slot else None
-                    plat = slot["platform"] if slot else None
-                    dev = slot["device"] if slot else None
-                    t_threads = threads_per_call
-                elif attempt == 1 and active_slots:
-                    # Retry 1: Fallback to the GPU with the most VRAM, with halved memory budget
-                    slot = fallback_slot
-                    target_bin = str(binary)
-                    target_kernel = opencl_kernel
-                    budget = max(128, (slot["budget_mb"] // 2)) if slot and slot.get("budget_mb") else 256
-                    plat = slot["platform"] if slot else None
-                    dev = slot["device"] if slot else None
-                    t_threads = 1
-                else:
-                    # CPU execution (full system RAM, no VRAM limits, standard multi-threaded itwom)
-                    slot = {"name": "CPU", "budget_mb": None, "platform": None, "device": None}
-                    target_bin = str(cpu_binary)
-                    target_kernel = ""
-                    budget = None
-                    plat = None
-                    dev = None
-                    t_threads = threads_per_call if not active_slots else max(1, cpu_count // max(1, workers))
-
                 fut = executor.submit(
                     _run_one_tile,
-                    target_bin,
+                    str(binary),
                     asdict(artifact),
                     asdict(tile),
                     request,
                     tx_x,
                     tx_y,
                     str(out_prefix),
-                    t_threads,
+                    threads_per_call,
                     job_id,
                     registry,
-                    target_kernel,
-                    budget,
-                    plat,
-                    dev,
                 )
-                in_flight[fut] = (tile, slot, attempt)
+                in_flight[fut] = (tile, attempt)
 
-            # Keep pool saturated with work (up to 2 * workers in-flight)
             max_in_flight = max(1, workers * 2)
             while pending_queue and len(in_flight) < max_in_flight:
                 _submit_tile(pending_queue.pop(0), attempt=0)
@@ -1143,8 +733,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                 )
 
                 for fut in done:
-                    tile, slot, attempt = in_flight.pop(fut)
-                    slot_name = slot.get("name", "Worker") if slot else "Worker"
+                    tile, attempt = in_flight.pop(fut)
                     try:
                         fut.result()
                         _advance_tile_progress_throttled(job_id, total, cells_per_tile=avg_cells_per_tile)
@@ -1153,10 +742,9 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                         next_attempt = attempt + 1
                         tile_attempts[(tile.x0, tile.y0)] = next_attempt
                         if next_attempt < 3:
-                            recovery_desc = "highest VRAM GPU with reduced memory budget" if next_attempt == 1 else "CPU fallback"
                             logger.warning(
-                                "⚠️ [Job %s] Tile (%d,%d) failed on %s (attempt %d/3): %s. Recovering via %s...",
-                                job_id, tile.x0, tile.y0, slot_name, next_attempt, err_msg, recovery_desc
+                                "⚠️ [Job %s] Tile (%d,%d) failed on CPU (attempt %d/3): %s. Retrying...",
+                                job_id, tile.x0, tile.y0, next_attempt, err_msg
                             )
                             _submit_tile(tile, attempt=next_attempt)
                         else:

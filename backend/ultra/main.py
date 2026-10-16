@@ -63,43 +63,68 @@ SINGLE_TILE_CELL_THRESHOLD = 1_000_000
 _cached_gpu_tile_cells: int | None = None
 
 
+_cached_gpu_info: dict | None = None
+_gpu_probed: bool = False
+
+
+def _probe_gpu(binary_path: Path) -> dict | None:
+    global _cached_gpu_info, _gpu_probed
+    if _gpu_probed:
+        return _cached_gpu_info
+    try:
+        import subprocess
+        proc = subprocess.run([str(binary_path), "--probe"], capture_output=True, text=True, timeout=5)
+        _gpu_probed = True
+        if proc.returncode == 0:
+            _cached_gpu_info = json.loads(proc.stdout)
+            return _cached_gpu_info
+    except Exception as exc:
+        _gpu_probed = True
+        logger.warning("Could not probe OpenCL device: %s", exc)
+    return None
+
+
 def _resolve_native_binary() -> tuple[Path, str]:
-    binary = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli")).resolve()
+    default_bin = Path(os.environ.get("ULTRA_CLI", "engine/build/ultra_cli")).resolve()
+
+    # Find CPU binary fallback candidate
+    cpu_candidates = [
+        default_bin if default_bin.name != "ultra_cli_opencl" else default_bin.with_name("ultra_cli"),
+        default_bin.with_name("ultra_cli"),
+        Path("/usr/local/bin/ultra_cli"),
+        Path("engine/build/ultra_cli"),
+    ]
+    resolved_cpu = None
+    for cand in cpu_candidates:
+        if cand.name != "ultra_cli_opencl" and cand.exists():
+            resolved_cpu = cand.resolve()
+            break
+    if not resolved_cpu:
+        resolved_cpu = default_bin
+
     opencl_kernel = os.environ.get("ULTRA_OPENCL_KERNEL", "")
     if not opencl_kernel:
         for cand in [Path("/usr/local/share/ultra/itm_kernel.cl"), Path("engine/opencl/itm_kernel.cl")]:
             if cand.exists():
                 opencl_kernel = str(cand.resolve())
                 break
+
     if opencl_kernel:
         candidates = [
-            binary.with_name("ultra_cli_opencl"),
+            default_bin if default_bin.name == "ultra_cli_opencl" else default_bin.with_name("ultra_cli_opencl"),
             Path("/usr/local/bin/ultra_cli_opencl"),
             Path("engine/build/ultra_cli_opencl"),
         ]
         for candidate in candidates:
             if candidate.exists():
-                binary = candidate.resolve()
+                probe = _probe_gpu(candidate)
+                if probe and _resolve_opencl_devices(probe):
+                    return candidate.resolve(), opencl_kernel
+                else:
+                    logger.info("ℹ️ OpenCL binary exists (%s), but no active GPU platforms/devices found. Using CPU runner.", candidate)
                 break
-    return binary, opencl_kernel
 
-
-_cached_gpu_info: dict | None = None
-
-
-def _probe_gpu(binary_path: Path) -> dict | None:
-    global _cached_gpu_info
-    if _cached_gpu_info is not None:
-        return _cached_gpu_info
-    try:
-        import subprocess
-        proc = subprocess.run([str(binary_path), "--probe"], capture_output=True, text=True, timeout=5)
-        if proc.returncode == 0:
-            _cached_gpu_info = json.loads(proc.stdout)
-            return _cached_gpu_info
-    except Exception as exc:
-        logger.warning("Could not probe OpenCL device: %s", exc)
-    return None
+    return resolved_cpu, ""
 
 
 def _resolve_opencl_devices(probe_info: dict | None) -> list[dict]:
@@ -959,7 +984,20 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
     registry = _ensure_pids_registry()
     job_pid_list = registry.setdefault(job_id, _active_pids_manager.list())
 
+    cpu_binary_candidate = Path(binary).with_name("ultra_cli")
+    if cpu_binary_candidate.exists():
+        cpu_binary = cpu_binary_candidate
+    elif Path("/usr/local/bin/ultra_cli").exists():
+        cpu_binary = Path("/usr/local/bin/ultra_cli")
+    elif Path("engine/build/ultra_cli").exists():
+        cpu_binary = Path("engine/build/ultra_cli")
+    else:
+        cpu_binary = Path(binary)
+
     if workers == 1:
+        single_bin = binary if active_slots else cpu_binary
+        single_kernel = opencl_kernel if active_slots else ""
+
         for tile in pending_tiles:
             if is_cancel_requested(job_id):
                 return NativeRunResult(
@@ -968,7 +1006,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                     message="Ultra job cancelled during tiled native execution.",
                 )
             cmd = _build_cmd(
-                binary,
+                single_bin,
                 artifact,
                 tile,
                 request,
@@ -976,7 +1014,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                 tx_y,
                 out_prefix,
                 threads=threads_per_call,
-                opencl_kernel=opencl_kernel,
+                opencl_kernel=single_kernel,
             )
             slot = active_slots[0] if active_slots else None
             env = os.environ.copy()
@@ -1030,9 +1068,6 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
             slots_by_vram = sorted(active_slots, key=lambda s: s.get("vram_mb", 0), reverse=True) if active_slots else []
             fallback_slot = slots_by_vram[0] if slots_by_vram else (active_slots[0] if active_slots else None)
 
-            cpu_binary_candidate = Path(binary).with_name("ultra_cli")
-            cpu_binary = cpu_binary_candidate if cpu_binary_candidate.exists() else Path(binary)
-
             pending_queue: list[TileSpec] = list(pending_tiles)
             tile_attempts: dict[tuple[int, int], int] = {}
             in_flight: dict[Any, tuple[TileSpec, dict | None, int]] = {}
@@ -1040,8 +1075,8 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
 
             def _submit_tile(tile: TileSpec, attempt: int) -> None:
                 nonlocal slot_idx
-                if attempt == 0:
-                    slot = active_slots[slot_idx % len(active_slots)] if active_slots else None
+                if attempt == 0 and active_slots:
+                    slot = active_slots[slot_idx % len(active_slots)]
                     slot_idx += 1
                     target_bin = str(binary)
                     target_kernel = opencl_kernel
@@ -1049,7 +1084,7 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                     plat = slot["platform"] if slot else None
                     dev = slot["device"] if slot else None
                     t_threads = threads_per_call
-                elif attempt == 1:
+                elif attempt == 1 and active_slots:
                     # Retry 1: Fallback to the GPU with the most VRAM, with halved memory budget
                     slot = fallback_slot
                     target_bin = str(binary)
@@ -1059,14 +1094,14 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
                     dev = slot["device"] if slot else None
                     t_threads = 1
                 else:
-                    # Retry 2: Ultimate fallback to CPU execution (full system RAM, no VRAM limits)
+                    # CPU execution (full system RAM, no VRAM limits, standard multi-threaded itwom)
                     slot = {"name": "CPU", "budget_mb": None, "platform": None, "device": None}
                     target_bin = str(cpu_binary)
                     target_kernel = ""
                     budget = None
                     plat = None
                     dev = None
-                    t_threads = max(1, cpu_count // max(1, workers))
+                    t_threads = threads_per_call if not active_slots else max(1, cpu_count // max(1, workers))
 
                 fut = executor.submit(
                     _run_one_tile,

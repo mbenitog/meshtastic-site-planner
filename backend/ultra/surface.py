@@ -44,6 +44,7 @@ class SurfaceGrid:
     mode: SurfaceMode
     values: np.ndarray
     sources: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.uint8))
+    terrain: np.ndarray | None = None
     """Per-cell source/origin. Same shape as ``values``. 0 = dtm fallback
     (DTM 5 m only, no 2.5 m DSM/vegetation sample available).
     1 = dtm + mdsn_e025 (2.5 m building DSM), 2 = dtm + mdsn_v025
@@ -54,6 +55,8 @@ class SurfaceGrid:
             self.values = np.asarray(self.values, dtype=np.float64)
         if not isinstance(self.sources, np.ndarray):
             self.sources = np.asarray(self.sources, dtype=np.uint8)
+        if self.terrain is not None and not isinstance(self.terrain, np.ndarray):
+            self.terrain = np.asarray(self.terrain, dtype=np.float32)
 
     @property
     def max_x(self) -> float:
@@ -118,13 +121,13 @@ def _arcgrid_lookup_filled(
     if grid.nodata is not None:
         src = np.where(src == grid.nodata, np.nan, src)
     cols = np.clip(
-        np.round((xs[None, :] - grid.xllcorner) / grid.cellsize).astype(np.int64),
+        np.floor((xs[None, :] - grid.xllcorner) / grid.cellsize).astype(np.int64),
         0,
         grid.ncols - 1,
     )
-    north = grid.yllcorner + (grid.nrows - 1) * grid.cellsize
+    north = grid.yllcorner + grid.nrows * grid.cellsize
     rows = np.clip(
-        np.round((north - ys[:, None]) / grid.cellsize).astype(np.int64),
+        np.floor((north - ys[:, None]) / grid.cellsize).astype(np.int64),
         0,
         grid.nrows - 1,
     )
@@ -336,6 +339,7 @@ class SurfaceBuilder:
             mode=mode,
             values=values_arr,
             sources=sources_arr,
+            terrain=terrain_arr,
         )
 
     def _try_fetch_dtm(

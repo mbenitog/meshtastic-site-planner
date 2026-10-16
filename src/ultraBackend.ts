@@ -40,6 +40,25 @@ interface UltraCoverageProbe {
     { available: boolean; error?: string; ncols?: number; nrows?: number; min_value?: number; max_value?: number }
   >;
   recommended_surface_mode: UltraSurfaceMode;
+  elevation?: UltraElevationProbe;
+}
+
+export interface UltraElevationProbe {
+  available: boolean;
+  lat: number;
+  lon: number;
+  ground_m?: number;
+  surface_m?: number;
+  structure_m?: number;
+  source?: string;
+  nearby_structure?: {
+    elevation_m: number;
+    distance_m: number;
+    height_above_point_m?: number;
+    lat: number;
+    lon: number;
+  } | null;
+  error?: string;
 }
 
 const SURFACE_MODE_LABELS: Record<UltraSurfaceMode, string> = {
@@ -65,6 +84,20 @@ export async function probeUltraCoverage(
     signal,
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ lat, lon, radius_m: radiusMeters }),
+  });
+}
+
+export async function probeUltraElevation(
+  baseUrl: string,
+  lat: number,
+  lon: number,
+  signal?: AbortSignal,
+): Promise<UltraElevationProbe> {
+  return readJson<UltraElevationProbe>(joinUrl(baseUrl, '/elevation/probe'), {
+    method: 'POST',
+    signal,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ lat, lon }),
   });
 }
 

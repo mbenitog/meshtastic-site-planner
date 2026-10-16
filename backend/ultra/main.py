@@ -1185,6 +1185,81 @@ def terrain_sample(request: TerrainSampleRequest) -> dict:
     }
 
 
+def probe_elevation_at_point(lat: float, lon: float) -> dict:
+    try:
+        import numpy as np
+        from .geo import latlon_to_utm30, utm30_to_latlon
+        x, y = latlon_to_utm30(lat, lon)
+        grid = surface_builder.build(
+            lat=lat,
+            lon=lon,
+            radius_m=35.0,
+            resolution_m=2.5,
+            mode="lod_dtm_plus_buildings",
+        )
+        col = max(0, min(grid.width - 1, int(round((x - grid.min_x) / grid.resolution_m))))
+        row = max(0, min(grid.height - 1, int(round((grid.max_y - y) / grid.resolution_m))))
+
+        surf_elev = float(grid.values[row, col])
+        ground_elev = float(grid.terrain[row, col]) if grid.terrain is not None else surf_elev
+        struct_height = max(0.0, surf_elev - ground_elev)
+        src_val = int(grid.sources[row, col])
+        source_names = {
+            0: "Bare ground (DTM only)",
+            1: "Building (mdsn_e025 2.5m)",
+            2: "Vegetation (mdsn_v025 2.5m)",
+            3: "LOD DSM (mds05 5m)",
+        }
+        src_desc = source_names.get(src_val, f"layer code {src_val}")
+
+        nearby = None
+        if grid.values.size > 0:
+            max_idx = np.argmax(grid.values)
+            max_r, max_c = np.unravel_index(max_idx, grid.values.shape)
+            max_val = float(grid.values[max_r, max_c])
+            max_x = grid.min_x + max_c * grid.resolution_m
+            max_y = grid.max_y - max_r * grid.resolution_m
+            dist = float(np.hypot(max_x - x, max_y - y))
+            if (max_val - surf_elev) >= 3.0 and dist >= 2.0:
+                n_lat, n_lon = utm30_to_latlon(max_x, max_y)
+                nearby = {
+                    "elevation_m": round(max_val, 1),
+                    "distance_m": round(dist, 1),
+                    "height_above_point_m": round(max_val - surf_elev, 1),
+                    "lat": round(n_lat, 6),
+                    "lon": round(n_lon, 6),
+                }
+
+        return {
+            "available": True,
+            "lat": lat,
+            "lon": lon,
+            "ground_m": round(ground_elev, 1),
+            "surface_m": round(surf_elev, 1),
+            "structure_m": round(struct_height, 1),
+            "source": src_desc,
+            "nearby_structure": nearby,
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "lat": lat,
+            "lon": lon,
+            "error": str(exc),
+        }
+
+
+class ElevationProbeRequest(BaseModel):
+    lat: float = Field(..., ge=-90, le=90)
+    lon: float = Field(..., ge=-180, le=180)
+
+
+@router.post("/elevation/probe")
+def elevation_probe(request: ElevationProbeRequest) -> dict:
+    """Probe surface and ground elevation at a specific point."""
+    return probe_elevation_at_point(request.lat, request.lon)
+
+
 class CoverageProbeRequest(BaseModel):
     lat: float = Field(..., ge=-90, le=90)
     lon: float = Field(..., ge=-180, le=180)
@@ -1230,6 +1305,7 @@ def coverage_probe(request: CoverageProbeRequest) -> dict:
         "bbox_25830": {"min_x": min_x, "min_y": min_y, "max_x": max_x, "max_y": max_y},
         "availability": availability,
         "recommended_surface_mode": recommended,
+        "elevation": probe_elevation_at_point(request.lat, request.lon),
     }
 
 

@@ -149,7 +149,17 @@ function joinUrl(base: string, path: string): string {
 async function readJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (!response.ok) throw new Error(`${url} failed: ${response.status}`);
-  return response.json() as Promise<T>;
+  const text = await response.text();
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    // Standard JSON rejects NaN, Infinity, and -Infinity, which Python's
+    // json.dumps emits by default. Replace them with null so parsing succeeds.
+    const sanitized = text
+      .replace(/([:\[,]\s*)NaN\b/g, '$1null')
+      .replace(/([:\[,]\s*)-?Infinity\b/g, '$1null');
+    return JSON.parse(sanitized) as T;
+  }
 }
 
 async function readArrayBuffer(url: string, signal?: AbortSignal): Promise<ArrayBuffer> {
@@ -238,7 +248,16 @@ export async function runUltraBackend(
   options.onJobCreated?.(job.job_id);
   emitProgress(job.progress, onProgress);
 
-  const state = await waitForUltraJob(baseUrl, job.job_id, signal, onProgress);
+  return loadUltraJobResult(baseUrl, job.job_id, signal, onProgress);
+}
+
+export async function loadUltraJobResult(
+  baseUrl: string,
+  jobId: string,
+  signal?: AbortSignal,
+  onProgress?: (p: CoverageProgress) => void,
+): Promise<UltraBackendResult> {
+  const state = await waitForUltraJob(baseUrl, jobId, signal, onProgress);
   if (state.status !== 'coverage_ready') {
     throw new Error(`Ultra backend job ${state.status}.`);
   }

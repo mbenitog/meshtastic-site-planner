@@ -17,13 +17,13 @@ from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from .geo import meter_bbox_around
 from .ign_dsm import IgnDsmClient
 from .surface import SurfaceBuilder, SurfaceMode
-from .artifacts import SurfaceArtifact
+from .artifacts import SurfaceArtifact, sanitize_for_json
 from .runner import NativeRunnerInput, NativeRunResult
 from .render import write_coverage_png, write_png_world_file
 from .tiler import plan_tiles, aggregate_tiles, make_native_run_result
@@ -396,7 +396,7 @@ def persist_job(job_id: str, job: dict) -> None:
     out.mkdir(parents=True, exist_ok=True)
     target = out / "job.json"
     tmp = out / f"job.json.tmp.{os.getpid()}.{time.time_ns()}"
-    tmp.write_text(json.dumps(job, indent=2) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(sanitize_for_json(job), indent=2, allow_nan=False) + "\n", encoding="utf-8")
     tmp.replace(target)
 
 
@@ -1046,7 +1046,10 @@ def _run_tiles_with_progress(job_id, artifact, request, tiles):
 
     meta = aggregate_tiles(artifact=artifact, tiles=tiles, out_dir=out_dir)
     meta["rx_sensitivity_dbm"] = request["rx_sensitivity_dbm"]
-    (out_dir / "coverage.meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    (out_dir / "coverage.meta.json").write_text(
+        json.dumps(sanitize_for_json(meta), indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
     payload = make_native_run_result(out_prefix)
     return NativeRunResult(**payload)
 
@@ -1343,7 +1346,49 @@ def surface_sample(request: SurfaceSampleRequest) -> dict:
 
 
 @router.post("/ultra/jobs")
-def create_ultra_job(payload: UltraJobRequest, background_tasks: BackgroundTasks) -> dict:
+def create_ultra_job(
+    payload: UltraJobRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+) -> dict:
+    req_dict = payload.model_dump()
+    # Cache reuse: if an identical completed job exists with all artifacts on disk, return it immediately.
+    for existing_id, existing_job in list(jobs.items()):
+        if existing_job.get("status") == "coverage_ready" and existing_job.get("request") == req_dict:
+            jdir = job_dir(existing_id)
+            if (jdir / "coverage.png").exists() and (jdir / "coverage.signal_i16le.bin").exists() and (jdir / "surface_meta.json").exists():
+                logger.info("⚡ [Job %s] Reusing existing completed ultra job with identical request", existing_id)
+                urls = artifact_urls(existing_id, request)
+                return {
+                    "job_id": existing_id,
+                    "status": existing_job["status"],
+                    "message": existing_job.get("message", "Native ultra coverage is ready (cached)."),
+                    "progress": existing_job.get("progress", {"phase": "finalize", "fraction": 1.0}),
+                    "estimate": existing_job.get("estimate", {}),
+                    "artifact_urls": urls,
+                }
+    if JOB_ROOT.exists():
+        for job_file in JOB_ROOT.glob("*/job.json"):
+            try:
+                disk_id = job_file.parent.name
+                disk_job = load_job(disk_id)
+                if disk_job and disk_job.get("status") == "coverage_ready" and disk_job.get("request") == req_dict:
+                    jdir = job_file.parent
+                    if (jdir / "coverage.png").exists() and (jdir / "coverage.signal_i16le.bin").exists() and (jdir / "surface_meta.json").exists():
+                        jobs[disk_id] = disk_job
+                        logger.info("⚡ [Job %s] Reusing existing completed ultra job from disk cache", disk_id)
+                        urls = artifact_urls(disk_id, request)
+                        return {
+                            "job_id": disk_id,
+                            "status": disk_job["status"],
+                            "message": disk_job.get("message", "Native ultra coverage is ready (cached)."),
+                            "progress": disk_job.get("progress", {"phase": "finalize", "fraction": 1.0}),
+                            "estimate": disk_job.get("estimate", {}),
+                            "artifact_urls": urls,
+                        }
+            except Exception:
+                continue
+
     job_id = str(uuid4())
     estimate = estimate_grid(payload.radius_km, payload.resolution_m)
     job = {
@@ -1395,7 +1440,7 @@ def cancel_ultra_job(job_id: str, request: Request) -> dict:
 
 
 @router.get("/ultra/jobs/{job_id}/artifacts/{artifact}")
-def get_ultra_artifact(job_id: str, artifact: ArtifactName) -> FileResponse:
+def get_ultra_artifact(job_id: str, artifact: ArtifactName) -> Response:
     job = jobs.get(job_id) or load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
@@ -1403,6 +1448,17 @@ def get_ultra_artifact(job_id: str, artifact: ArtifactName) -> FileResponse:
     path = job_dir(job_id) / filename
     if not path.exists():
         raise HTTPException(status_code=404, detail="artifact not found")
+    if media_type == "application/json":
+        text = path.read_text(encoding="utf-8")
+        if "NaN" in text or "Infinity" in text:
+            import re
+            text = re.sub(r"([:\[,]\s*)NaN\b", r"\g<1>null", text)
+            text = re.sub(r"([:\[,]\s*)-?Infinity\b", r"\g<1>null", text)
+            try:
+                path.write_text(text, encoding="utf-8")
+            except Exception:
+                pass
+        return Response(content=text, media_type="application/json")
     return FileResponse(path, media_type=media_type, filename=filename)
 
 

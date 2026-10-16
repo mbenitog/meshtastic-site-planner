@@ -25,7 +25,11 @@ app.mount('#app')
 
 // A shared permalink (#9) was applied during store init; persist it and clear
 // the hash so subsequent edits win on the next reload.
-useStore(pinia).consumeSharedLink()
+const store = useStore(pinia);
+store.consumeSharedLink();
+if (typeof window !== 'undefined') {
+  (window as any).store = store;
+}
 
 // Register the PWA service worker (#11) in production only, so it never
 // intercepts Vite's dev server or HMR.

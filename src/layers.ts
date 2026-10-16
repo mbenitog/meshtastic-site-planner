@@ -34,11 +34,11 @@ export function sitePinElement(): HTMLElement {
   return el;
 }
 
-/** Draft transmitter position (before a run): same pin, pulsing halo. */
+/** Draft transmitter position (before a run): same pin, pulsing halo + live elevation tooltip. */
 export function draftPinElement(): HTMLElement {
   const el = document.createElement('div');
   el.className = 'mt-pin mt-pin-draft';
-  el.innerHTML = `<span class="mt-pin-pulse" aria-hidden="true"></span>${PIN_SVG}`;
+  el.innerHTML = `<span class="mt-pin-pulse" aria-hidden="true"></span>${PIN_SVG}<div class="mt-pin-tooltip" style="display:none"></div>`;
   return el;
 }
 

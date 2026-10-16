@@ -14,6 +14,47 @@
         <label for="tx_lon" class="mt-label">Longitude (degrees)</label>
         <input v-model="transmitter.tx_lon" type="number" class="mt-input" id="tx_lon" min="-180" max="180" step="0.000001" title="Transmitter longitude in degrees (-180 to 180)." />
       </div>
+      <!-- Real-time elevation probe (Option B) -->
+      <div class="col-span-2 my-1">
+        <div v-if="store.elevationProbeLoading" class="p-2 rounded bg-slate-800/80 border border-slate-700/60 text-xs flex items-center gap-2 text-slate-300">
+          <span class="mt-spinner" aria-hidden="true"></span>
+          <span>Midiendo cota del terreno y superficie (IGN LiDAR)…</span>
+        </div>
+        <div v-else-if="store.elevationProbe && store.elevationProbe.available" class="p-2.5 rounded bg-slate-800/90 border border-slate-700 text-xs flex flex-col gap-1.5 shadow-sm">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-1.5">
+              <span v-if="(store.elevationProbe.structure_m ?? 0) > 0.5" class="text-emerald-400 font-semibold flex items-center gap-1">
+                🏢 Superficie: {{ store.elevationProbe.surface_m }} m
+                <span class="text-emerald-300/80 font-normal text-[11px]">(+{{ store.elevationProbe.structure_m }} m estructura)</span>
+              </span>
+              <span v-else class="text-slate-200 font-semibold flex items-center gap-1">
+                📍 Cota suelo: {{ store.elevationProbe.surface_m }} m s.n.m.
+              </span>
+            </div>
+            <span class="text-[10px] text-slate-400 bg-slate-900/60 px-1.5 py-0.5 rounded border border-slate-700/50">
+              {{ store.elevationProbe.source }}
+            </span>
+          </div>
+          <div class="text-[11px] text-slate-400 flex justify-between">
+            <span>Terreno base (DTM): <strong>{{ store.elevationProbe.ground_m }} m</strong></span>
+            <span>Total con antena: <strong class="text-slate-200">{{ ((store.elevationProbe.surface_m ?? 0) + (transmitter.tx_height || 0)).toFixed(1) }} m ASL</strong></span>
+          </div>
+          <!-- Nearby high structure alert -->
+          <div v-if="store.elevationProbe.nearby_structure" class="mt-1 pt-1.5 border-t border-slate-700/60 flex items-center justify-between gap-2 text-amber-300 bg-amber-950/30 -mx-1 px-2 py-1 rounded">
+            <span class="text-[11px] leading-tight">
+              ⚠️ Estructura alta a <strong>{{ store.elevationProbe.nearby_structure.distance_m }} m</strong> (cota <strong>{{ store.elevationProbe.nearby_structure.elevation_m }} m</strong>, +{{ store.elevationProbe.nearby_structure.height_above_point_m }} m)
+            </span>
+            <button
+              type="button"
+              @click="snapToNearbyStructure"
+              class="mt-btn mt-btn-sm py-0.5 px-2 text-[10px] bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold whitespace-nowrap cursor-pointer"
+              title="Mover el transmisor a la azotea detectada"
+            >
+              Mover a azotea
+            </button>
+          </div>
+        </div>
+      </div>
       <div class="col-span-2">
         <label for="device" class="mt-label">Device (optional)</label>
         <select v-model="selectedDevice" @change="applyDevice" class="mt-select" id="device" title="Prefill power and stock-antenna gain from a common Meshtastic device.">
@@ -113,6 +154,16 @@ const centerMapOnTransmitter = () => {
   }
 };
 
+function snapToNearbyStructure() {
+  const nearby = store.elevationProbe?.nearby_structure;
+  if (!nearby) return;
+  transmitter.tx_lat = nearby.lat;
+  transmitter.tx_lon = nearby.lon;
+  store.setTxCoords(nearby.lat, nearby.lon);
+  store.setDraftMarker(nearby.lat, nearby.lon);
+  store.getMap()?.flyTo({ center: [nearby.lon, nearby.lat], zoom: Math.max(store.getMap()?.getZoom() ?? 15, 16) });
+}
+
 // Typing coordinates moves (or creates) the draggable draft pin, so the
 // text fields and the map marker always agree. Skipped mid-simulation.
 watch(
@@ -122,6 +173,7 @@ watch(
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
     if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return;
     store.setDraftMarker(lat, lon);
+    store.fetchElevationProbeDebounced(lat, lon);
   }
 );
 

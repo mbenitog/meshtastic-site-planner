@@ -333,7 +333,7 @@ def stitch_arcgrids(
             continue
         t_x0 = tile.xllcorner
         t_y0 = tile.yllcorner
-        t_y1 = t_y0 + (t_nrows - 1) * tile.cellsize
+        t_y1 = t_y0 + t_nrows * tile.cellsize
 
         col0 = int(round((t_x0 - min_x) / cell_size))
         row0 = int(round((max_y - t_y1) / cell_size))

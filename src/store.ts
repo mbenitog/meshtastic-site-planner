@@ -26,7 +26,7 @@ import {
 } from './permalink.ts';
 import { coverageStats } from './coverageStats.ts';
 import { TerrainService } from './terrain/TerrainService.ts';
-import { cancelUltraJob, runUltraBackend, probeUltraCoverage, type UltraSurfaceMode } from './ultraBackend.ts';
+import { cancelUltraJob, runUltraBackend, probeUltraCoverage, probeUltraElevation, type UltraSurfaceMode, type UltraElevationProbe } from './ultraBackend.ts';
 import type { UltraBackendResult } from './ultraBackend.ts';
 
 // Module-level singletons: workers, terrain cache, and map handles outlive
@@ -36,6 +36,8 @@ let terrain: TerrainService | undefined;
 let abortController: AbortController | undefined;
 let map: maplibregl.Map | undefined;
 let currentMarker: maplibregl.Marker | undefined;
+let probeAbort: AbortController | undefined;
+let probeTimer: ReturnType<typeof setTimeout> | undefined;
 const siteMarkers = new Map<string, maplibregl.Marker>();
 // Active only while "place on map" is armed.
 let placeEscHandler: ((e: KeyboardEvent) => void) | undefined;
@@ -280,6 +282,9 @@ const useStore = defineStore('store', {
       measureMode: false,
       measureResult: null as { distanceKm: number; bearingDeg: number } | null,
       currentUltraJobId: '' as string,
+      /** Real-time elevation probe for the current transmitter position (#Option B). */
+      elevationProbe: null as UltraElevationProbe | null,
+      elevationProbeLoading: false,
     }
   },
   actions: {
@@ -288,14 +293,73 @@ const useStore = defineStore('store', {
       return map;
     },
     setTxCoords(lat: number, lon: number) {
-      this.splatParams.transmitter.tx_lat = lat
-      this.splatParams.transmitter.tx_lon = lon
+      this.splatParams.transmitter.tx_lat = lat;
+      this.splatParams.transmitter.tx_lon = lon;
+      this.fetchElevationProbe(lat, lon);
+    },
+    updateMarkerTooltip() {
+      if (!currentMarker) return;
+      const el = currentMarker.getElement();
+      const tip = el.querySelector<HTMLElement>('.mt-pin-tooltip');
+      if (!tip) return;
+      if (this.elevationProbeLoading) {
+        tip.style.display = 'block';
+        tip.className = 'mt-pin-tooltip mt-pin-tooltip-loading';
+        tip.textContent = 'Midiendo cota…';
+        return;
+      }
+      const probe = this.elevationProbe;
+      if (!probe || !probe.available) {
+        tip.style.display = 'none';
+        return;
+      }
+      tip.style.display = 'block';
+      if ((probe.structure_m ?? 0) > 0.5) {
+        tip.className = 'mt-pin-tooltip mt-pin-tooltip-structure';
+        tip.innerHTML = `🏢 ${probe.surface_m}m <span style="opacity:0.85;font-size:9px">(+${probe.structure_m}m)</span>`;
+      } else {
+        tip.className = 'mt-pin-tooltip mt-pin-tooltip-ground';
+        tip.textContent = `📍 ${probe.surface_m}m s.n.m.`;
+      }
+    },
+    async fetchElevationProbe(lat: number, lon: number) {
+      if (probeAbort) {
+        probeAbort.abort();
+        probeAbort = undefined;
+      }
+      const ac = new AbortController();
+      probeAbort = ac;
+      this.elevationProbeLoading = true;
+      this.updateMarkerTooltip();
+      try {
+        const baseUrl = this.splatParams.simulation.ultra_backend_url || defaultUltraBackendUrl();
+        const res = await probeUltraElevation(baseUrl, lat, lon, ac.signal);
+        if (ac.signal.aborted) return;
+        this.elevationProbe = res;
+      } catch {
+        if (ac.signal.aborted) return;
+        this.elevationProbe = null;
+      } finally {
+        if (!ac.signal.aborted) {
+          this.elevationProbeLoading = false;
+          this.updateMarkerTooltip();
+        }
+      }
+    },
+    fetchElevationProbeDebounced(lat: number, lon: number) {
+      if (probeTimer) clearTimeout(probeTimer);
+      this.elevationProbeLoading = true;
+      this.updateMarkerTooltip();
+      probeTimer = setTimeout(() => {
+        this.fetchElevationProbe(lat, lon);
+      }, 180);
     },
     /** Place or move the draggable draft transmitter marker. */
     setDraftMarker(lat: number, lon: number) {
       if (!map) return;
       if (currentMarker) {
         currentMarker.setLngLat([lon, lat]);
+        this.updateMarkerTooltip();
         return;
       }
       currentMarker = new maplibregl.Marker({
@@ -305,12 +369,18 @@ const useStore = defineStore('store', {
       })
         .setLngLat([lon, lat])
         .addTo(map);
-      // Dragging the pin updates the transmitter coordinates live.
+      // Dragging the pin updates the probe live.
+      currentMarker.on('drag', () => {
+        const ll = currentMarker!.getLngLat();
+        const lng = wrapLon(ll.lng);
+        this.fetchElevationProbeDebounced(Number(ll.lat.toFixed(6)), Number(lng.toFixed(6)));
+      });
       currentMarker.on('dragend', () => {
         const ll = currentMarker!.getLngLat();
-        const lng = ((((ll.lng + 180) % 360) + 360) % 360) - 180;
+        const lng = wrapLon(ll.lng);
         this.setTxCoords(Number(ll.lat.toFixed(6)), Number(lng.toFixed(6)));
       });
+      this.updateMarkerTooltip();
     },
     clearDraftMarker() {
       currentMarker?.remove();
@@ -895,6 +965,10 @@ const useStore = defineStore('store', {
         this.splatParams.transmitter.tx_lat,
         this.splatParams.transmitter.tx_lon
       );
+      this.fetchElevationProbe(
+        this.splatParams.transmitter.tx_lat,
+        this.splatParams.transmitter.tx_lon
+      );
       // Site markers survive in-session navigation.
       for (const marker of siteMarkers.values()) marker.addTo(map);
     },
@@ -951,6 +1025,10 @@ const useStore = defineStore('store', {
                   abortController.signal,
                 );
                 surfaceMode = probe.recommended_surface_mode;
+                if (probe.elevation) {
+                  this.elevationProbe = probe.elevation;
+                  this.updateMarkerTooltip();
+                }
                 console.log('Ultra surface mode probe:', probe.availability, '->', surfaceMode);
               } catch (probeErr) {
                 console.warn('Ultra coverage probe failed, falling back to LOD mode:', probeErr);

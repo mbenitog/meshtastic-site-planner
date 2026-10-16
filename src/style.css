@@ -372,6 +372,43 @@ body {
   }
 }
 
+.mt-pin-tooltip {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  margin-bottom: 6px;
+  background: rgba(15, 16, 23, 0.94);
+  color: #fff;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  line-height: 1.25;
+  text-align: center;
+  z-index: 10;
+  transition: opacity 0.15s ease-in-out;
+}
+
+.mt-pin-tooltip-structure {
+  border-color: #67ea94;
+  color: #67ea94;
+}
+
+.mt-pin-tooltip-ground {
+  border-color: rgba(255, 255, 255, 0.25);
+  color: #f1f5f9;
+}
+
+.mt-pin-tooltip-loading {
+  color: #94a3b8;
+  font-style: italic;
+}
+
 /* ---------- Map: dark-themed MapLibre controls ---------- */
 
 .maplibregl-ctrl-group {

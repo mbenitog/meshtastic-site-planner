@@ -1,6 +1,13 @@
 import type { CoverageResult } from './engine/CoverageEngine';
 import type { CoverageStats } from './coverageStats';
 
+export interface CoverageTile {
+    url: string;
+    coordinates: [[number, number], [number, number], [number, number], [number, number]];
+    width?: number;
+    height?: number;
+}
+
 export interface Site {
     params: SplatParams;
     /** Unique id for list rendering (was the backend task id). */
@@ -13,6 +20,7 @@ export interface Site {
     stats: CoverageStats;
     /** Optional backend artifacts for ultra runs. */
     artifacts?: {
+        coverageTiles?: CoverageTile[];
         coveragePngUrl?: string;
         coverageWorldUrl?: string;
         coverageMetaUrl?: string;

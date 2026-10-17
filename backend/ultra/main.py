@@ -25,7 +25,7 @@ from .ign_dsm import IgnDsmClient
 from .surface import SurfaceBuilder, SurfaceMode
 from .artifacts import SurfaceArtifact, sanitize_for_json
 from .runner import NativeRunnerInput, NativeRunResult
-from .render import write_coverage_png, write_png_world_file
+from .render import write_coverage_png, write_png_world_file, write_coverage_tiles
 from .tiler import plan_tiles, aggregate_tiles, make_native_run_result, TileSpec
 
 
@@ -432,6 +432,7 @@ ArtifactName = Literal[
     "coverage_meta",
     "coverage_png",
     "coverage_world",
+    "coverage_tiles",
 ]
 ARTIFACT_FILES: dict[str, tuple[str, str]] = {
     "job": ("job.json", "application/json"),
@@ -443,6 +444,7 @@ ARTIFACT_FILES: dict[str, tuple[str, str]] = {
     "coverage_meta": ("coverage.meta.json", "application/json"),
     "coverage_png": ("coverage.png", "image/png"),
     "coverage_world": ("coverage.pgw", "text/plain"),
+    "coverage_tiles": ("coverage_tiles.json", "application/json"),
 }
 
 
@@ -782,10 +784,22 @@ def run_ultra_job(job_id: str, request: UltraJobRequest) -> None:
                 height=artifact.height,
                 bounds_wgs84=artifact.bounds_wgs84,
             )
+            tiles = write_coverage_tiles(
+                signal_path=native_result.signal_path or "",
+                mask_path=native_result.mask_path or "",
+                out_dir=job_dir(job_id),
+                width=artifact.width,
+                height=artifact.height,
+                resolution_m=artifact.resolution_m,
+                min_x=artifact.min_x,
+                max_y=artifact.max_y,
+                min_dbm=request.rx_sensitivity_dbm,
+            )
             render_dur = time.perf_counter() - t_render
             total_dur = time.perf_counter() - t_start
             rate = (artifact.width * artifact.height) / max(0.01, compute_dur)
             job["coverage_png"] = {"path": png_path, "world_path": world_path}
+            job["coverage_tiles"] = {"count": len(tiles)}
             job["status"] = "coverage_ready"
             set_progress(job, "finalize", 1.0)
             job["message"] = (
@@ -1684,6 +1698,18 @@ def get_ultra_artifact(job_id: str, artifact: ArtifactName) -> Response:
                 pass
         return Response(content=text, media_type="application/json")
     return FileResponse(path, media_type=media_type, filename=filename)
+
+
+@router.get("/ultra/jobs/{job_id}/tiles/{tile_name}")
+def get_ultra_tile(job_id: str, tile_name: str) -> Response:
+    job = jobs.get(job_id) or load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    clean_name = Path(tile_name).name
+    path = job_dir(job_id) / "tiles" / clean_name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="tile not found")
+    return FileResponse(path, media_type="image/png", filename=clean_name)
 
 
 class PollingLogFilter(logging.Filter):

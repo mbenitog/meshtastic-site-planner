@@ -108,6 +108,8 @@ export async function cancelUltraJob(baseUrl: string, jobId: string): Promise<vo
   if (!response.ok) throw new Error(`cancel failed: ${response.status}`);
 }
 
+import type { CoverageTile } from './types';
+
 interface UltraSurfaceMeta {
   bounds_wgs84?: CoverageResult['bounds'];
   corners_wgs84?: [[number, number], [number, number], [number, number], [number, number]];
@@ -117,6 +119,7 @@ interface UltraSurfaceMeta {
 
 export interface UltraBackendResult extends CoverageResult {
   artifacts: {
+    coverageTiles?: CoverageTile[];
     coveragePngUrl?: string;
     coverageWorldUrl?: string;
     coverageMetaUrl?: string;
@@ -285,6 +288,26 @@ export async function loadUltraJobResult(
   const dbm = new Float32Array(values.length);
   for (let i = 0; i < values.length; i++) dbm[i] = values[i] / 10;
 
+  let coverageTiles: CoverageTile[] | undefined;
+  if (state.artifact_urls.coverage_tiles) {
+    try {
+      const rawTiles = await readJson<
+        Array<{
+          url: string;
+          coordinates: [[number, number], [number, number], [number, number], [number, number]];
+          width?: number;
+          height?: number;
+        }>
+      >(joinUrl(baseUrl, state.artifact_urls.coverage_tiles), { signal });
+      coverageTiles = rawTiles.map((t) => ({
+        ...t,
+        url: joinUrl(baseUrl, t.url),
+      }));
+    } catch (e) {
+      console.warn('Failed to fetch coverage tiles manifest:', e);
+    }
+  }
+
   const bounds = surfaceMeta.bounds_wgs84;
   if (!bounds) throw new Error('Ultra backend did not return WGS84 surface bounds');
   return {
@@ -302,6 +325,7 @@ export async function loadUltraJobResult(
       workers: 1,
     },
     artifacts: {
+      coverageTiles,
       coveragePngUrl: state.artifact_urls.coverage_png ? joinUrl(baseUrl, state.artifact_urls.coverage_png) : undefined,
       coverageWorldUrl: state.artifact_urls.coverage_world ? joinUrl(baseUrl, state.artifact_urls.coverage_world) : undefined,
       coverageMetaUrl: joinUrl(baseUrl, metaUrl),

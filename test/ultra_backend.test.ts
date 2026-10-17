@@ -112,6 +112,57 @@ describe('runUltraBackend', () => {
     expect(result.artifacts.coverageMetaUrl).toBe('http://ultra.test/ultra-api/ultra/jobs/abc/artifacts/coverage_meta');
   });
 
+  it('loads coverage_tiles when present in artifact_urls', async () => {
+    globalThis.fetch = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+      lastUrl = String(url);
+      if (lastUrl.endsWith('/ultra/jobs')) {
+        return jsonResponse({ job_id: 'tiled', status: 'queued', artifact_urls: {}, progress: { phase: 'terrain', fraction: 0.1 } });
+      }
+      if (lastUrl.endsWith('/ultra/jobs/tiled')) {
+        return jsonResponse({
+          job_id: 'tiled',
+          status: 'coverage_ready',
+          artifact_urls: {
+            coverage_meta: 'http://ultra.test/ultra-api/ultra/jobs/tiled/artifacts/coverage_meta',
+            surface_meta: 'http://ultra.test/ultra-api/ultra/jobs/tiled/artifacts/surface_meta',
+            coverage_signal: 'http://ultra.test/ultra-api/ultra/jobs/tiled/artifacts/coverage_signal',
+            coverage_tiles: 'http://ultra.test/ultra-api/ultra/jobs/tiled/artifacts/coverage_tiles',
+          },
+        });
+      }
+      if (lastUrl.endsWith('coverage_meta')) {
+        return jsonResponse({ width: 4, height: 4, model: 'itm_projected_grid' });
+      }
+      if (lastUrl.endsWith('surface_meta')) {
+        return jsonResponse({
+          bounds_wgs84: { north: 40.42, south: 40.41, east: -3.69, west: -3.71 },
+          corners_wgs84: [[-3.71, 40.42], [-3.69, 40.42], [-3.69, 40.41], [-3.71, 40.41]],
+        });
+      }
+      if (lastUrl.endsWith('coverage_signal')) {
+        return new Response(new Int16Array(16).buffer, {
+          headers: { 'content-type': 'application/octet-stream' },
+        });
+      }
+      if (lastUrl.endsWith('coverage_tiles')) {
+        return jsonResponse([
+          {
+            url: '/ultra/jobs/tiled/tiles/tile_0_0.png',
+            coordinates: [[-3.71, 40.42], [-3.69, 40.42], [-3.69, 40.41], [-3.71, 40.41]],
+            width: 4,
+            height: 4,
+          },
+        ]);
+      }
+      throw new Error(`unexpected fetch ${lastUrl}`);
+    }) as unknown as typeof fetch;
+
+    const result = await runUltraBackend(PARAMS);
+    expect(result.artifacts.coverageTiles).toBeDefined();
+    expect(result.artifacts.coverageTiles?.length).toBe(1);
+    expect(result.artifacts.coverageTiles?.[0].url).toBe('http://ultra.test/ultra/jobs/tiled/tiles/tile_0_0.png');
+  });
+
   it('throws when the backend job fails', async () => {
     globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => {
       lastUrl = String(url);

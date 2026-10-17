@@ -807,14 +807,25 @@ const useStore = defineStore('store', {
       if (el) el.style.display = site.visible ? '' : 'none';
       this.syncOverlays();
     },
-    /** Remove every layer/source for one site's overlay (either style). */
+    /** Remove every layer/source for one site's overlay (either style, single or tiled). */
     removeOverlay(siteId: string) {
       if (!map) return;
-      const id = `coverage-${siteId}`;
-      for (const layerId of [`${id}-line`, id]) {
-        if (map.getLayer(layerId)) map.removeLayer(layerId);
+      const prefix = `coverage-${siteId}`;
+      const style = map.getStyle();
+      if (style?.layers) {
+        for (const layer of style.layers) {
+          if (layer.id === prefix || layer.id.startsWith(`${prefix}-`)) {
+            if (map.getLayer(layer.id)) map.removeLayer(layer.id);
+          }
+        }
       }
-      if (map.getSource(id)) map.removeSource(id);
+      if (style?.sources) {
+        for (const sourceId of Object.keys(style.sources)) {
+          if (sourceId === prefix || sourceId.startsWith(`${prefix}-`)) {
+            if (map.getSource(sourceId)) map.removeSource(sourceId);
+          }
+        }
+      }
     },
     /** Switch all overlays between the raster heatmap and vector contours. */
     setOverlayStyle(style: 'heatmap' | 'contours') {
@@ -847,6 +858,7 @@ const useStore = defineStore('store', {
         this.removeOverlay(site.id);
         if (site.visible === false) return; // hidden via the site-list toggle
         const opacity = 1 - site.params.display.overlay_transparency / 100;
+        const ultraTiles = site.artifacts?.coverageTiles;
         const ultraRaster =
           site.artifacts?.coveragePngUrl && site.artifacts?.coverageCoordinates
             ? {
@@ -855,7 +867,7 @@ const useStore = defineStore('store', {
               }
             : null;
 
-        if (this.overlayStyle === 'contours' && !ultraRaster) {
+        if (this.overlayStyle === 'contours' && !ultraRaster && !ultraTiles) {
           const geojson = coverageContours(site.result, {
             colorScale: site.params.display.color_scale,
             minDbm: site.params.display.min_dbm,
@@ -876,6 +888,21 @@ const useStore = defineStore('store', {
             type: 'line',
             source: id,
             paint: { 'line-color': ['get', 'color'], 'line-width': 0.6, 'line-opacity': Math.min(1, opacity + 0.25) },
+          });
+        } else if (ultraTiles && ultraTiles.length > 0) {
+          ultraTiles.forEach((tile, index) => {
+            const tileId = `${id}-tile-${index}`;
+            map!.addSource(tileId, {
+              type: 'image',
+              url: tile.url,
+              coordinates: tile.coordinates,
+            });
+            map!.addLayer({
+              id: tileId,
+              type: 'raster',
+              source: tileId,
+              paint: { 'raster-opacity': opacity, 'raster-resampling': 'nearest' },
+            });
           });
         } else {
           const image = ultraRaster

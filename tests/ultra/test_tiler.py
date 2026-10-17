@@ -82,3 +82,47 @@ def test_aggregate_tiles_uses_per_tile_files(tmp_path: Path):
         {"x0": 0, "y0": 2, "width": 2, "height": 2},
         {"x0": 2, "y0": 2, "width": 2, "height": 2},
     ]
+
+
+def test_write_coverage_tiles(tmp_path: Path):
+    from backend.ultra.render import write_coverage_tiles
+    import json
+
+    w, h = 6, 4
+    sig = tmp_path / "sig.bin"
+    mask = tmp_path / "mask.bin"
+    # Write -90.0 dBm (-900) everywhere
+    sig.write_bytes(struct.pack("<24h", *([-900] * 24)))
+    # Only top-left 3x2 has mask=1, rest mask=0
+    mask_bytes = bytearray(24)
+    for r in range(2):
+        for c in range(3):
+            mask_bytes[r * w + c] = 1
+    mask.write_bytes(bytes(mask_bytes))
+
+    tiles = write_coverage_tiles(
+        signal_path=sig,
+        mask_path=mask,
+        out_dir=tmp_path,
+        width=w,
+        height=h,
+        resolution_m=2.5,
+        min_x=440000.0,
+        max_y=4470000.0,
+        min_dbm=-130.0,
+        max_tile_dim=3,
+    )
+
+    # 6x4 with max_tile_dim=3 means 2 columns x 2 rows = 4 possible tiles.
+    # Only tile (0, 0) has mask=1, so only 1 tile is written!
+    assert len(tiles) == 1
+    assert tiles[0]["c0"] == 0
+    assert tiles[0]["r0"] == 0
+    assert tiles[0]["width"] == 3
+    assert tiles[0]["height"] == 3
+    assert (tmp_path / "coverage_tiles.json").exists()
+    assert (tmp_path / "tiles" / "tile_0_0.png").exists()
+
+    data = json.loads((tmp_path / "coverage_tiles.json").read_text(encoding="utf-8"))
+    assert len(data) == 1
+    assert len(data[0]["coordinates"]) == 4

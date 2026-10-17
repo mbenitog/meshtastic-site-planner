@@ -75,7 +75,7 @@ def write_coverage_png(
     height: int,
     min_dbm: float,
     max_dbm: float = -80.0,
-    max_dim: int = 8192,
+    max_dim: int = 8000,
 ) -> str:
     cells = width * height
     signal_arr = np.fromfile(str(signal_path), dtype="<i2")
@@ -120,7 +120,7 @@ def write_coverage_tiles(
     max_y: float,
     min_dbm: float,
     max_dbm: float = -80.0,
-    max_tile_dim: int = 4096,
+    max_tile_dim: int = 2000,
 ) -> list[dict]:
     """Slice coverage signal and mask arrays into tiles <= max_tile_dim and write
     per-tile PNGs to `out_dir / "tiles"`. Returns a list of tile specs with WGS84 corners.

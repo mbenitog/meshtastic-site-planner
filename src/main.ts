@@ -1,5 +1,6 @@
 import { createApp } from 'vue'
 import 'maplibre-gl/dist/maplibre-gl.css'
+import './map/maplibreFix'
 import './style.css'
 import App from './App.vue'
 import { createPinia } from 'pinia'

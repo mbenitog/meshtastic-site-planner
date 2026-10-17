@@ -180,4 +180,41 @@ describe('runUltraBackend', () => {
     }) as unknown as typeof fetch;
     await expect(runUltraBackend(PARAMS)).rejects.toThrow(/failed/);
   });
+
+  it('patches maplibregl.ImageSource so textures report isSizePowerOfTwo === false', async () => {
+    const { patchMapLibreImageSource } = await import('../src/map/maplibreFix');
+    patchMapLibreImageSource();
+    const maplibregl = (await import('maplibre-gl')).default;
+    const evented = { listens: () => false, fire: () => {} };
+    const source = new (maplibregl as any).ImageSource('test-img', {
+      url: 'http://test/img.png',
+      coordinates: [[0, 0], [1, 0], [1, 1], [0, 1]],
+    }, {} as any, evented);
+    source.image = { width: 4096, height: 4096 };
+    source.tiles = { '0': { state: 'unloaded' } };
+    const fakeStore = { set: () => {}, setDefault: () => {} };
+    source.map = {
+      painter: {
+        context: {
+          gl: {
+            createTexture: () => ({}),
+            bindTexture: () => {},
+            texParameteri: () => {},
+            texImage2D: () => {},
+            RGBA: 6408,
+            LINEAR: 9729,
+            CLAMP_TO_EDGE: 33071,
+          },
+          pixelStoreUnpackFlipY: fakeStore,
+          pixelStoreUnpack: fakeStore,
+          pixelStoreUnpackPremultiplyAlpha: fakeStore,
+        },
+      },
+      fire: () => {},
+    };
+    source.prepare();
+    expect(source.texture).toBeDefined();
+    expect(source.texture.isSizePowerOfTwo()).toBe(false);
+  });
 });
+

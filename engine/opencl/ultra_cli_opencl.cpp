@@ -197,7 +197,18 @@ int main(int argc, char **argv) {
     const char *kernel_path = arg_s(argc, argv, "--kernel");
     if (!kernel_path) kernel_path = "engine/opencl/itm_kernel.cl";
     bool force_fp32 = false;
-    for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--fp32") == 0) force_fp32 = true;
+    bool force_fp64 = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--fp32") == 0) force_fp32 = true;
+        if (strcmp(argv[i], "--fp64") == 0) force_fp64 = true;
+    }
+    const char *env_prec = getenv("ULTRA_PRECISION");
+    if (env_prec) {
+        if (strcmp(env_prec, "fp64") == 0 || strcmp(env_prec, "FP64") == 0 || strcmp(env_prec, "double") == 0)
+            force_fp64 = true;
+        else if (strcmp(env_prec, "fp32") == 0 || strcmp(env_prec, "FP32") == 0 || strcmp(env_prec, "float") == 0)
+            force_fp32 = true;
+    }
     bool cpu_profiles = false;
     for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--cpu-profiles") == 0) cpu_profiles = true;
 
@@ -341,10 +352,7 @@ int main(int argc, char **argv) {
     /* ---- pick device ---- */
     DevicePick pick;
     if (pick_device(forced_plat, forced_dev, &pick) != 0) return 1;
-    bool use_double = pick.has_fp64 && !force_fp32;
-    if (!use_double && !force_fp32 && !pick.has_fp64) {
-        /* no fp64 available, using fp32 */
-    }
+    bool use_double = pick.has_fp64 && force_fp64 && !force_fp32;
     fprintf(stderr, "opencl device: %s  fp64=%s  using=%s\n", pick.name,
             pick.has_fp64 ? "yes" : "no", use_double ? "FP64" : "FP32");
 
@@ -355,22 +363,32 @@ int main(int argc, char **argv) {
     cl_ulong max_alloc = 0;
     clGetDeviceInfo(pick.device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc, NULL);
 
-    /* ---- surface loading: direct full load or adaptive subgrid ---- */
+    /* ---- surface loading: adaptive 2D bounding-box subgrid crop ---- */
     size_t full_surf_bytes = (size_t)width * (size_t)height * sizeof(int16_t);
-    size_t safe_max_surf_alloc = max_alloc > 0 ? (size_t)((double)max_alloc * 0.85) : (size_t)1024 * 1024 * 1024;
+    size_t safe_max_surf_alloc = (size_t)1920 * 1024 * 1024;
+    if (max_alloc > 0) {
+        safe_max_surf_alloc = std::min(safe_max_surf_alloc, (size_t)((double)max_alloc * 0.85));
+    }
     size_t safe_vram_surf_limit = global_mem > 0 ? (size_t)((double)global_mem * 0.45) : (size_t)1024 * 1024 * 1024;
     size_t max_direct_surf_bytes = std::min(safe_max_surf_alloc, safe_vram_surf_limit);
 
+    int bbox_x0 = std::max(0, std::min(tx_col, tile_x0) - 2);
+    int bbox_x1 = std::min(width - 1, std::max(tx_col, tile_x0 + tile_w - 1) + 2);
+    int bbox_y0 = std::max(0, std::min(tx_row, tile_y0) - 2);
+    int bbox_y1 = std::min(height - 1, std::max(tx_row, tile_y0 + tile_h - 1) + 2);
+    int bbox_w = bbox_x1 - bbox_x0 + 1;
+    int bbox_h = bbox_y1 - bbox_y0 + 1;
+    size_t bbox_bytes = (size_t)bbox_w * (size_t)bbox_h * sizeof(int16_t);
+
     int crop_x0 = 0, crop_y0 = 0, crop_w = width, crop_h = height;
-    bool needs_crop = (full_surf_bytes > max_direct_surf_bytes);
+    bool needs_crop = (full_surf_bytes > max_direct_surf_bytes) ||
+                      (bbox_bytes < (size_t)((double)full_surf_bytes * 0.75));
 
     if (needs_crop) {
-        crop_x0 = std::max(0, std::min(tx_col, tile_x0) - 2);
-        int crop_x1 = std::min(width - 1, std::max(tx_col, tile_x0 + tile_w - 1) + 2);
-        crop_y0 = std::max(0, std::min(tx_row, tile_y0) - 2);
-        int crop_y1 = std::min(height - 1, std::max(tx_row, tile_y0 + tile_h - 1) + 2);
-        crop_w = crop_x1 - crop_x0 + 1;
-        crop_h = crop_y1 - crop_y0 + 1;
+        crop_x0 = bbox_x0;
+        crop_y0 = bbox_y0;
+        crop_w = bbox_w;
+        crop_h = bbox_h;
     }
 
     int rel_tx_col = tx_col - crop_x0;
@@ -579,10 +597,13 @@ int main(int argc, char **argv) {
 
     /* OpenCL single buffer constraint:
      * Never request a single buffer (especially d_prof) that exceeds
-     * CL_DEVICE_MAX_MEM_ALLOC_SIZE (often ~2GB to 4GB even on 24GB+ cards).
-     * We cap d_prof to 85% of max_alloc for safe driver headroom. */
-    if (max_alloc > 0) {
-        size_t safe_max_alloc = (size_t)((double)max_alloc * 0.85);
+     * CL_DEVICE_MAX_MEM_ALLOC_SIZE or the 2 GB signed-32-bit OpenCL
+     * driver addressing limit (~1920 MB safe ceiling). */
+    {
+        size_t safe_max_alloc = (size_t)1920 * 1024 * 1024;
+        if (max_alloc > 0) {
+            safe_max_alloc = std::min(safe_max_alloc, (size_t)((double)max_alloc * 0.85));
+        }
         int max_prof_items = (int)(safe_max_alloc / ((size_t)stride_prof * elem_size));
         if (max_prof_items > 0 && batch_size > max_prof_items) {
             batch_size = max_prof_items;

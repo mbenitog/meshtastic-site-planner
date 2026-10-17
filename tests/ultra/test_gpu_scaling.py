@@ -30,25 +30,25 @@ MOCK_PROBE_DICT = {
 def test_get_optimal_gpu_slots_scales_with_surface_footprint():
     binary = Path("/fake/ultra_cli_opencl")
     with patch("backend.ultra.main._probe_gpu", return_value=MOCK_PROBE_DICT):
-        # 10km radius: small surface (~120 MB)
+        # 10km radius: small surface (~120 MB) -> 1 dedicated worker per GPU (2 total)
         slots_10km = ultra_main.get_optimal_gpu_slots(binary, "kernel_str", total_tiles=100, cpu_count=16, surf_bytes_mb=120)
-        assert len(slots_10km) >= 2
+        assert len(slots_10km) == 2
 
-        # 30km radius: large surface (~1098 MB)
+        # 30km radius: large surface (~1098 MB) -> 1 dedicated worker per GPU (2 total)
         slots_30km = ultra_main.get_optimal_gpu_slots(binary, "kernel_str", total_tiles=289, cpu_count=16, surf_bytes_mb=1098)
-        assert len(slots_30km) >= 2
+        assert len(slots_30km) == 2
 
         # Count workers per GPU for 30km
         rtx2070_workers = [s for s in slots_30km if "2070" in s["name"]]
         rtx3060_workers = [s for s in slots_30km if "3060" in s["name"]]
-        assert len(rtx2070_workers) <= 2
-        assert len(rtx3060_workers) == 2
+        assert len(rtx2070_workers) == 1
+        assert len(rtx3060_workers) == 1
 
-        # Verify that memory budget per worker is positive and safely bounded by max_alloc
+        # Verify that memory budget per worker is positive and safely bounded by 1920 MB (2GB OpenCL buffer limit)
         for s in slots_30km:
-            assert s["budget_mb"] >= 256
+            assert 256 <= s["budget_mb"] <= 1920
 
-    # Verify high-end GPU scaling (e.g. 24GB VRAM, 128 CUs): multiple workers with maximal safe budget
+    # Verify high-end GPU scaling (e.g. 24GB VRAM, 128 CUs): 1 dedicated worker with maximal safe single-buffer budget (1920 MB)
     high_end_probe = {
         "devices": [
             {
@@ -64,8 +64,8 @@ def test_get_optimal_gpu_slots_scales_with_surface_footprint():
     }
     with patch("backend.ultra.main._probe_gpu", return_value=high_end_probe):
         slots_he = ultra_main.get_optimal_gpu_slots(binary, "kernel_str", total_tiles=289, cpu_count=32, surf_bytes_mb=1098)
-        assert len(slots_he) >= 2
-        assert slots_he[0]["budget_mb"] >= 2048
+        assert len(slots_he) == 1
+        assert slots_he[0]["budget_mb"] == 1920
 
     # Verify explicit ULTRA_MAX_WORKERS_PER_GPU environment override allows multiple workers per GPU if requested
     with patch("backend.ultra.main._probe_gpu", return_value=high_end_probe), \

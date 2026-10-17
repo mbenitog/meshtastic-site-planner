@@ -295,21 +295,17 @@ def get_optimal_gpu_slots(
         # Usable VRAM: reserve 15% (or at least 384 MB) for OS display manager, X11/Wayland, and driver heap
         vram_usable_mb = max(512, int(vram_mb * 0.85) - 384)
 
-        # Real per-worker memory footprint:
-        safe_surf_mb = min(surf_bytes_mb, int(vram_usable_mb * 0.45), int(max_alloc_mb * 0.85) if max_alloc_mb else 2048)
+        # OpenCL single buffer constraint: cap to 85% of max_alloc_mb and <= 1920 MB (2GB signed-32-bit safe ceiling)
+        safe_max_alloc_mb = min(1920, int(max_alloc_mb * 0.85)) if max_alloc_mb else 1920
+
+        # Real per-worker memory footprint (with 2D bounding-box cropping, any quadrant tile uses <= 25% of full grid)
+        effective_surf_mb = surf_bytes_mb // 4 if total_tiles >= 4 else surf_bytes_mb
+        safe_surf_mb = min(effective_surf_mb, int(vram_usable_mb * 0.45), safe_max_alloc_mb)
         fixed_overhead_per_worker = safe_surf_mb + 256
-        safe_max_alloc_mb = int(max_alloc_mb * 0.85) if max_alloc_mb else 2048
 
-        # Target profile budget per worker: ideally up to 1500 MB (saturates 128+ SMs)
-        target_profile_mb = min(safe_max_alloc_mb, 1500)
-        worker_footprint_mb = fixed_overhead_per_worker + target_profile_mb
-        max_workers_by_vram = max(1, vram_usable_mb // max(1, worker_footprint_mb))
-
-        # Hardware occupancy: ensure at least 14 CUs per worker to avoid warp scheduling thrashing
-        max_workers_by_cu = max(1, compute_units // 14)
-
-        # High-performance default: balance VRAM and CU occupancy (up to 4 workers per GPU)
-        dev_workers = max(1, min(max_workers_by_vram, max_workers_by_cu, 4))
+        # Architecture: 1 dedicated worker per physical GPU guarantees 100% SM/CU saturation via large batches,
+        # zero driver context-switching, and zero duplicate VRAM allocations.
+        dev_workers = 1
         if env_max_w_per_gpu:
             min_worker_footprint = fixed_overhead_per_worker + min_profile_budget_mb
             dev_workers = max(1, min(int(env_max_w_per_gpu), vram_usable_mb // max(1, min_worker_footprint)))
@@ -318,7 +314,6 @@ def get_optimal_gpu_slots(
         # Dynamic profile budget per worker:
         vram_per_worker_mb = vram_usable_mb // dev_workers
         available_profile_mb = vram_per_worker_mb - fixed_overhead_per_worker
-        # OpenCL single buffer constraint: cap to 85% of max_alloc_mb (typically ~2-4GB)
         profile_budget_mb = min(safe_max_alloc_mb, max(min_profile_budget_mb, available_profile_mb))
         if user_budget is not None:
             profile_budget_mb = user_budget

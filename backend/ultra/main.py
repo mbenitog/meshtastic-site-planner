@@ -1461,16 +1461,19 @@ class CoverageProbeRequest(BaseModel):
 def coverage_probe(request: CoverageProbeRequest) -> dict:
     """Return which IGN coverage layers are available for the bbox so the UI
     can pick a surface mode before submitting a job."""
-    min_x, min_y, max_x, max_y = meter_bbox_around(request.lat, request.lon, request.radius_m)
+    # Probe a representative 1000m window around the transmitter so the IGN WCS server
+    # never rejects the probe due to cell limits, while accurately probing layer availability.
+    probe_r = min(request.radius_m, 1000.0)
+    p_min_x, p_min_y, p_max_x, p_max_y = meter_bbox_around(request.lat, request.lon, probe_r)
     availability: dict[str, dict] = {}
     for coverage_id in ("mds05", "mdsn_v025", "mdsn_e025"):
         try:
             grid = ign.fetch_arcgrid(
                 coverage_id=coverage_id,
-                min_x=min_x,
-                min_y=min_y,
-                max_x=max_x,
-                max_y=max_y,
+                min_x=p_min_x,
+                min_y=p_min_y,
+                max_x=p_max_x,
+                max_y=p_max_y,
             )
             availability[coverage_id] = {
                 "available": True,
@@ -1487,11 +1490,8 @@ def coverage_probe(request: CoverageProbeRequest) -> dict:
     mdsn_e025 = availability.get("mdsn_e025", {}).get("available", False)
     mdsn_v025 = availability.get("mdsn_v025", {}).get("available", False)
     mds05 = availability.get("mds05", {}).get("available", False)
-    recommended = (
-        "lod_dtm_plus_buildings"
-        if mdsn_e025 or mds05
-        else "dtm_only"
-    )
+    recommended = "lod_dtm_plus_buildings"
+    min_x, min_y, max_x, max_y = meter_bbox_around(request.lat, request.lon, request.radius_m)
     return {
         "bbox_25830": {"min_x": min_x, "min_y": min_y, "max_x": max_x, "max_y": max_y},
         "availability": availability,

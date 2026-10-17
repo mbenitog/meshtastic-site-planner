@@ -261,3 +261,82 @@ def test_create_ultra_job_reuses_completed_job(tmp_path: Path):
             shutil.rmtree(jdir, ignore_errors=True)
 
 
+def test_coverage_probe_large_radius_never_fails_or_downgrades():
+    """Probing coverage for a 30km radius must not crash with WCS bbox limits and must recommend combined surface mode."""
+    r = client.post(
+        _url("/coverage/probe"),
+        json={"lat": 39.435, "lon": -0.465, "radius_m": 30000.0},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["recommended_surface_mode"] == "lod_dtm_plus_buildings"
+    assert "error" not in data.get("availability", {}).get("mdsn_e025", {})
+
+
+def test_surface_builder_mixed_coverage_preserves_streets_and_rooftops():
+    """Verify that SurfaceBuilder layers 2.5m buildings and streets sharply without being blurred by 5m DSM."""
+    import numpy as np
+    from backend.ultra.surface import SurfaceBuilder, ArcGrid
+    from backend.ultra.coverage_json import CoverageGrid
+
+    class MockIgn:
+        pass
+
+    class MockCoverage:
+        pass
+
+    def mock_fetch_dtm(min_x, min_y, max_x, max_y, *args, **kwargs):
+        return CoverageGrid(
+            width=10,
+            height=10,
+            min_x=min_x,
+            max_x=max_x,
+            min_y=min_y,
+            max_y=max_y,
+            values=[50.0] * 100,
+        )
+
+    def mock_fetch_arcgrid(cov, min_x, min_y, max_x, max_y, *args, **kwargs):
+        if cov == "mdsn_e025":
+            b_vals = np.full((10, 10), np.nan, dtype=np.float32)
+            b_vals[1, 0] = 15.0  # Rooftop
+            b_vals[1, 1] = 0.0   # Street at (0, 1)
+            return ArcGrid(
+                ncols=10,
+                nrows=10,
+                xllcorner=min_x,
+                yllcorner=min_y,
+                cellsize=2.5,
+                values=b_vals.ravel(),
+                nodata=-9999.0,
+            )
+        return ArcGrid(
+            ncols=5,
+            nrows=5,
+            xllcorner=min_x,
+            yllcorner=min_y,
+            cellsize=5.0,
+            values=[58.0] * 25,
+            nodata=-9999.0,
+        )
+
+    builder = SurfaceBuilder(dsm_client=MockIgn(), coverage_client=MockCoverage())
+    builder._try_fetch_dtm = mock_fetch_dtm
+    builder._try_fetch_arcgrid = mock_fetch_arcgrid
+
+    res = builder.build(lat=40.0, lon=-3.0, radius_m=11.25, resolution_m=2.5, mode="lod_dtm_plus_buildings")
+    vals = res.values
+
+    # Cell (0, 0) is a 2.5m rooftop: ground (50) + building (15) = 65m
+    assert vals[0, 0] == 65.0
+    assert res.sources[0, 0] == 1  # 2.5m LiDAR
+
+    # Cell (0, 1) is a 2.5m street: ground (50) + street (0) = 50m (NOT blurred by 5m DSM which is 58m!)
+    assert vals[0, 1] == 50.0
+    assert res.sources[0, 1] == 1  # 2.5m LiDAR
+
+    # Cell (5, 5) is outside 2.5m coverage: must use 5m DSM (58.0m)
+    assert vals[5, 5] == 58.0
+    assert res.sources[5, 5] == 3  # 5m DSM
+
+

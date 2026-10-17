@@ -284,16 +284,6 @@ class SurfaceBuilder:
         surface_5m_raw = _arcgrid_lookup_filled(surface_5m, xs, ys)
         del surface_5m
 
-        building_m = np.where(
-            np.isnan(building_raw), np.float32(0.0), np.maximum(np.float32(0.0), building_raw)
-        )
-        del building_raw
-
-        vegetation_m = np.where(
-            np.isnan(vegetation_raw), np.float32(0.0), np.maximum(np.float32(0.0), vegetation_raw)
-        )
-        del vegetation_raw
-
         surface_5m_m = np.where(
             np.isnan(surface_5m_raw),
             np.float32(np.nan),
@@ -305,36 +295,35 @@ class SurfaceBuilder:
             values_arr = terrain_arr
             sources_arr = np.zeros(terrain_arr.shape, dtype=np.uint8)
         else:
-            has_building = building_m > 0.0
-            has_vegetation = (vegetation_m > 0.0) & ~has_building
+            has_25m = ~np.isnan(building_raw)
+            if mode == "dtm_plus_surface_2_5m":
+                has_25m = has_25m | (~np.isnan(vegetation_raw))
 
             values_arr = terrain_arr.copy()
             sources_arr = np.zeros(terrain_arr.shape, dtype=np.uint8)
 
-            building_obstruction = np.maximum(building_m, vegetation_m)
-            building_source = np.where(
-                vegetation_m >= building_m,
-                np.uint8(2),
-                np.uint8(1),
-            ).astype(np.uint8)
-
-            values_arr[has_building] = terrain_arr[has_building] + building_obstruction[has_building]
-            sources_arr[has_building] = building_source[has_building]
-            del building_m, building_obstruction, building_source
-
-            values_arr[has_vegetation] = terrain_arr[has_vegetation] + vegetation_m[has_vegetation]
-            sources_arr[has_vegetation] = np.uint8(2)
-            del vegetation_m
-
-            # LOD fallback only for lod_dtm_plus_buildings: value = surface_5m_m,
-            # source = 3, bypasses the terrain + obstruction addition.
+            # 1. Base layer: 5m surface (MDS05) where 2.5m LiDAR is not available
             if mode == "lod_dtm_plus_buildings":
-                has_lod = ~has_building & ~has_vegetation & ~np.isnan(surface_5m_m)
-                values_arr[has_lod] = surface_5m_m[has_lod]
-                sources_arr[has_lod] = np.uint8(3)
-                del surface_5m_m, has_lod
+                has_5m = (~has_25m) & (~np.isnan(surface_5m_m))
+                values_arr[has_5m] = surface_5m_m[has_5m]
+                sources_arr[has_5m] = np.uint8(3)
+                del has_5m
 
-            del has_building, has_vegetation
+            # 2. Priority layer: 2.5m surface layered on top wherever available
+            building_clean = np.where(np.isnan(building_raw), np.float32(0.0), np.maximum(np.float32(0.0), building_raw))
+            vegetation_clean = np.where(np.isnan(vegetation_raw), np.float32(0.0), np.maximum(np.float32(0.0), vegetation_raw))
+            obstruction = np.maximum(building_clean, vegetation_clean)
+
+            values_arr[has_25m] = terrain_arr[has_25m] + obstruction[has_25m]
+
+            src_layer = np.where(
+                obstruction > 0,
+                np.where(vegetation_clean >= building_clean, np.uint8(2), np.uint8(1)),
+                np.uint8(1),
+            )
+            sources_arr[has_25m] = src_layer[has_25m]
+
+            del building_raw, vegetation_raw, building_clean, vegetation_clean, obstruction, src_layer, has_25m, surface_5m_m
 
         values_arr = np.nan_to_num(values_arr, nan=0.0)
         terrain_arr = np.nan_to_num(terrain_arr, nan=0.0)

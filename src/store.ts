@@ -1091,14 +1091,17 @@ const useStore = defineStore('store', {
                   this.splatParams.simulation.simulation_extent * 1000,
                   abortController.signal,
                 );
-                surfaceMode = probe.recommended_surface_mode;
+                surfaceMode = probe.recommended_surface_mode || 'lod_dtm_plus_buildings';
+                if (surfaceMode === 'dtm_only') {
+                  surfaceMode = 'lod_dtm_plus_buildings';
+                }
                 if (probe.elevation) {
                   this.elevationProbe = probe.elevation;
                   this.updateMarkerTooltip();
                 }
                 console.log('Ultra surface mode probe:', probe.availability, '->', surfaceMode);
               } catch (probeErr) {
-                console.warn('Ultra coverage probe failed, falling back to LOD mode:', probeErr);
+                console.warn('Ultra coverage probe failed, using combined surface mode:', probeErr);
               }
               return runUltraBackend(this.splatParams, abortController.signal, (p) => {
                 this.progress = p;

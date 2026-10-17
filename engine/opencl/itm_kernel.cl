@@ -1044,7 +1044,6 @@ __kernel void itm_p2p_kernel(
 /* ----------------------------------------------------------------------- */
 
 static void build_profile_cl(__global const short* surface, int surf_w, int surf_h,
-                             int surf_x0, int surf_y0, int full_w, int full_h,
                              int tx_col, int tx_row, int rx_col, int rx_row,
                              real_t resolution,
                              __global real_t* elev, int stride)
@@ -1058,8 +1057,8 @@ static void build_profile_cl(__global const short* surface, int surf_w, int surf
     elev[1] = dist / (real_t)segments;
     for (int i = 0; i <= segments; i++) {
         real_t t = (real_t)i / (real_t)segments;
-        int col = imin(imax((int)round((real_t)tx_col + (real_t)dx * t) - surf_x0, 0), surf_w - 1);
-        int row = imin(imax((int)round((real_t)tx_row + (real_t)dy * t) - surf_y0, 0), surf_h - 1);
+        int col = imin(imax((int)round((real_t)tx_col + (real_t)dx * t), 0), surf_w - 1);
+        int row = imin(imax((int)round((real_t)tx_row + (real_t)dy * t), 0), surf_h - 1);
         elev[i + 2] = (real_t)surface[(size_t)row * (size_t)surf_w + (size_t)col];
     }
     for (int i = segments + 3; i < segments + 16 && i < stride; i++)
@@ -1103,7 +1102,7 @@ __kernel void itm_cells_kernel(
     __global real_t* elev = prof_pool + (size_t)gid * (size_t)stride_prof;
     __global real_t* scr  = scratch_pool + (size_t)gid * (size_t)D1THX_SCRATCH_LEN;
 
-    build_profile_cl(surface, surf_w, surf_h, 0, 0, surf_w, surf_h, tx_col, tx_row, col, row,
+    build_profile_cl(surface, surf_w, surf_h, tx_col, tx_row, col, row,
                      resolution, elev, stride_prof);
 
     /* Ensure profile writes are visible to the ITM computation. */
@@ -1139,7 +1138,7 @@ __kernel void debug_profile_kernel(
     int rx_col, int rx_row,
     __global real_t* out_profile, int stride)
 {
-    build_profile_cl(surface, surf_w, surf_h, 0, 0, surf_w, surf_h, tx_col, tx_row, rx_col, rx_row,
+    build_profile_cl(surface, surf_w, surf_h, tx_col, tx_row, rx_col, rx_row,
                      resolution, out_profile, stride);
 }
 
@@ -1152,8 +1151,7 @@ __kernel void build_profiles_kernel(
     int tx_col, int tx_row, real_t resolution,
     int tile_x0, int tile_y0, int tile_w, int tile_h,
     int batch_start, int batch_count, int total_cells,
-    __global real_t* prof_pool, int stride_prof,
-    int surf_x0, int surf_y0, int full_w, int full_h)
+    __global real_t* prof_pool, int stride_prof)
 {
     int gid = get_global_id(0);
     if (gid >= batch_count) return;
@@ -1164,7 +1162,7 @@ __kernel void build_profiles_kernel(
     int col = tile_x0 + local_col;
     int row = tile_y0 + local_row;
     __global real_t* elev = prof_pool + (size_t)gid * (size_t)stride_prof;
-    build_profile_cl(surface, surf_w, surf_h, surf_x0, surf_y0, full_w, full_h,
+    build_profile_cl(surface, surf_w, surf_h,
                      tx_col, tx_row, col, row, resolution, elev, stride_prof);
 }
 

@@ -12,7 +12,7 @@ from dataclasses import asdict
 
 logger = logging.getLogger("uvicorn.error")
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Any
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Request
@@ -26,7 +26,7 @@ from .surface import SurfaceBuilder, SurfaceMode
 from .artifacts import SurfaceArtifact, sanitize_for_json
 from .runner import NativeRunnerInput, NativeRunResult
 from .render import write_coverage_png, write_png_world_file
-from .tiler import plan_tiles, aggregate_tiles, make_native_run_result
+from .tiler import plan_tiles, aggregate_tiles, make_native_run_result, TileSpec
 
 
 ULTRA_API_PREFIX = os.environ.get("ULTRA_API_PREFIX", "/ultra-api").rstrip("/") or ""
@@ -61,6 +61,11 @@ JOB_ROOT = Path(".cache/ultra-jobs")
 TILE_MAX_CELLS = 250_000
 SINGLE_TILE_CELL_THRESHOLD = 1_000_000
 _cached_gpu_tile_cells: int | None = None
+
+
+def clamp_i(val: int, lo: int, hi: int) -> int:
+    """Clamp integer val to the [lo, hi] inclusive range."""
+    return max(lo, min(hi, val))
 
 
 _cached_gpu_info: dict | None = None
@@ -293,37 +298,29 @@ def get_optimal_gpu_slots(
         vram_usable_mb = max(512, int(vram_mb * 0.85) - 384)
 
         # Real per-worker memory footprint:
-        # - Cropped 2D surface subgrid [TX..tile] in int16: at most ~28% of full grid when TX is centered
-        #   (~12% average); we budget 35% of surf_bytes_mb for peak concurrent subgrid footprint.
-        # - OpenCL context + JIT compiled program + runtime heap: ~384 MB
-        effective_surf_mb = int(surf_bytes_mb * 0.35)
-        fixed_overhead_per_worker = effective_surf_mb + 384
+        # Effective surface memory (capped to single allocation limit or 45% VRAM)
+        safe_surf_mb = min(surf_bytes_mb, int(vram_usable_mb * 0.45), int(max_alloc_mb * 0.85) if max_alloc_mb else 2048)
+        fixed_overhead_per_worker = safe_surf_mb + 256
         min_worker_footprint = fixed_overhead_per_worker + min_profile_budget_mb
 
-        # Maximum workers that physically fit in usable VRAM without memory allocation failure
-        max_workers_by_vram = max(1, vram_usable_mb // max(1, min_worker_footprint))
-
-        # Hardware saturation: each worker requires sufficient Compute Units (SMs)
-        # to achieve high execution occupancy without warp-scheduling contention.
-        # Giving at least 14 CUs per worker prevents performance degradation.
-        max_workers_by_cu = max(1, compute_units // 14)
-
-        dev_workers = max(1, min(max_workers_by_vram, max_workers_by_cu))
+        # Default: 1 dedicated worker per physical GPU guarantees 100% execution pipeline efficiency,
+        # zero driver context-switching overhead, and maximal unfragmented VRAM allocation.
+        dev_workers = 1
         if env_max_w_per_gpu:
-            dev_workers = max(1, min(dev_workers, int(env_max_w_per_gpu)))
+            max_workers_by_vram = max(1, vram_usable_mb // max(1, min_worker_footprint))
+            dev_workers = max(1, min(int(env_max_w_per_gpu), max_workers_by_vram))
         dev_workers = min(dev_workers, max(1, total_tiles))
 
-        # Hardware-proportional profile budget (scales with SMs and L2 cache,
-        # preventing driver heap compaction and VRAM bus saturation):
-        ideal_profile_budget_mb = min(max_alloc_mb, max(512, int(compute_units * 16)))
-
+        # Dynamic profile budget per worker:
         vram_per_worker_mb = vram_usable_mb // dev_workers
         available_profile_mb = vram_per_worker_mb - fixed_overhead_per_worker
-        profile_budget_mb = min(ideal_profile_budget_mb, max(min_profile_budget_mb, available_profile_mb))
+        # OpenCL single buffer constraint: cap to 85% of max_alloc_mb (typically ~2-4GB)
+        safe_max_alloc_mb = int(max_alloc_mb * 0.85) if max_alloc_mb else 2048
+        profile_budget_mb = min(safe_max_alloc_mb, max(min_profile_budget_mb, available_profile_mb))
         if user_budget is not None:
             profile_budget_mb = user_budget
 
-        logger.info("  ↳ [GPU %d:%d] %s (%d MB VRAM, %d CUs) -> %d workers (~%d MB profile/w, ~%d MB total/w)",
+        logger.info("  ↳ [GPU %d:%d] %s (%d MB VRAM, %d CUs) -> %d worker(s) (~%d MB profile/w, ~%d MB total/w)",
                     d["platform"], d["device"], d["name"], vram_mb, compute_units, dev_workers, profile_budget_mb,
                     fixed_overhead_per_worker + profile_budget_mb)
 
@@ -1305,7 +1302,7 @@ class TerrainSampleRequest(BaseModel):
 class UltraJobRequest(BaseModel):
     lat: float = Field(..., ge=-90, le=90)
     lon: float = Field(..., ge=-180, le=180)
-    radius_km: float = Field(..., gt=0, le=30)
+    radius_km: float = Field(..., gt=0)
     frequency_mhz: float = Field(..., gt=20, le=20000)
     tx_height_m: float = Field(..., ge=0)
     rx_height_m: float = Field(..., ge=0)

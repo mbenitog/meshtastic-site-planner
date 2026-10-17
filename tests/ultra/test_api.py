@@ -86,7 +86,7 @@ def test_ultra_job_request_rejects_bad_radius():
         json={
             "lat": 40.4,
             "lon": -3.7,
-            "radius_km": 100,  # > 30 limit
+            "radius_km": -1.0,  # <= 0 is invalid
             "frequency_mhz": 869.525,
             "tx_height_m": 2,
             "rx_height_m": 1,
@@ -98,6 +98,24 @@ def test_ultra_job_request_rejects_bad_radius():
         },
     )
     assert r.status_code == 422
+
+    r0 = client.post(
+        _url("/ultra/jobs"),
+        json={
+            "lat": 40.4,
+            "lon": -3.7,
+            "radius_km": 0.0,  # <= 0 is invalid
+            "frequency_mhz": 869.525,
+            "tx_height_m": 2,
+            "rx_height_m": 1,
+            "tx_power_w": 0.15,
+            "tx_gain_dbi": 3,
+            "rx_gain_dbi": 3,
+            "rx_sensitivity_dbm": -130,
+            "resolution_m": 2.5,
+        },
+    )
+    assert r0.status_code == 422
 
 
 def test_default_prefix_is_ultra_api():

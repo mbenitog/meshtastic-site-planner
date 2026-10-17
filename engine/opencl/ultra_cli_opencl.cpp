@@ -459,12 +459,14 @@ int main(int argc, char **argv) {
 
     /* Cache precompiled device binary in /tmp with atomic writes to eliminate
      * JIT compilation and driver shader-cache lock contention. */
-    char bin_path[256];
-    snprintf(bin_path, sizeof(bin_path), "/tmp/ultra_cl_%s_%s.bin",
-             use_double ? "fp64" : "fp32", pick.name);
-    for (char *p = bin_path; *p; p++) {
+    char clean_name[128];
+    snprintf(clean_name, sizeof(clean_name), "%s", pick.name);
+    for (char *p = clean_name; *p; p++) {
         if (*p == ' ' || *p == '/' || *p == ':' || *p == '(' || *p == ')') *p = '_';
     }
+    char bin_path[256];
+    snprintf(bin_path, sizeof(bin_path), "/tmp/ultra_cl_%s_%s.bin",
+             use_double ? "fp64" : "fp32", clean_name);
 
     FILE *fbin = fopen(bin_path, "rb");
     if (fbin) {
@@ -745,8 +747,9 @@ int main(int argc, char **argv) {
                 double *dst = cpu_prof_buf.data() + (size_t)g * stride_prof;
                 dst[0] = (double)segs;
                 dst[1] = dist / segs;
+                double inv_segs = 1.0 / (double)segs;
                 for (int i = 0; i <= segs; i++) {
-                    double t = (double)i / (double)segs;
+                    double t = (double)i * inv_segs;
                     int c = clamp_i((int)llround((double)rel_tx_col + (double)dx * t), 0, crop_w - 1);
                     int r = clamp_i((int)llround((double)rel_tx_row + (double)dy * t), 0, crop_h - 1);
                     dst[i + 2] = (double)surface[(size_t)r * crop_w + c];

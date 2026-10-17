@@ -241,16 +241,14 @@ def get_optimal_tile_cells(binary_path: Path, opencl_kernel: str) -> int:
         return TILE_MAX_CELLS
     devices = _resolve_opencl_devices(info)
     max_vram = max((d.get("vram_mb", 0) for d in devices), default=info.get("vram_mb", 0))
-    if max_vram >= 12000:
+    if max_vram >= 6000:
         tile_cells = 4_000_000
-    elif max_vram >= 6000:
-        tile_cells = 2_000_000
     elif max_vram >= 3000:
-        tile_cells = 1_000_000
+        tile_cells = 2_000_000
     elif max_vram >= 1500:
-        tile_cells = 500_000
+        tile_cells = 1_000_000
     else:
-        tile_cells = 250_000
+        tile_cells = 500_000
     dev_names = ", ".join(d.get("name", "GPU") for d in devices) if devices else info.get("device", "GPU")
     logger.info("🎮 [GPU Auto-scale] Active: %s (max %d MB VRAM) -> optimal tile size: %d cells",
                 dev_names, max_vram, tile_cells)
@@ -298,24 +296,29 @@ def get_optimal_gpu_slots(
         vram_usable_mb = max(512, int(vram_mb * 0.85) - 384)
 
         # Real per-worker memory footprint:
-        # Effective surface memory (capped to single allocation limit or 45% VRAM)
         safe_surf_mb = min(surf_bytes_mb, int(vram_usable_mb * 0.45), int(max_alloc_mb * 0.85) if max_alloc_mb else 2048)
         fixed_overhead_per_worker = safe_surf_mb + 256
-        min_worker_footprint = fixed_overhead_per_worker + min_profile_budget_mb
+        safe_max_alloc_mb = int(max_alloc_mb * 0.85) if max_alloc_mb else 2048
 
-        # Default: 1 dedicated worker per physical GPU guarantees 100% execution pipeline efficiency,
-        # zero driver context-switching overhead, and maximal unfragmented VRAM allocation.
-        dev_workers = 1
+        # Target profile budget per worker: ideally up to 1500 MB (saturates 128+ SMs)
+        target_profile_mb = min(safe_max_alloc_mb, 1500)
+        worker_footprint_mb = fixed_overhead_per_worker + target_profile_mb
+        max_workers_by_vram = max(1, vram_usable_mb // max(1, worker_footprint_mb))
+
+        # Hardware occupancy: ensure at least 14 CUs per worker to avoid warp scheduling thrashing
+        max_workers_by_cu = max(1, compute_units // 14)
+
+        # High-performance default: balance VRAM and CU occupancy (up to 4 workers per GPU)
+        dev_workers = max(1, min(max_workers_by_vram, max_workers_by_cu, 4))
         if env_max_w_per_gpu:
-            max_workers_by_vram = max(1, vram_usable_mb // max(1, min_worker_footprint))
-            dev_workers = max(1, min(int(env_max_w_per_gpu), max_workers_by_vram))
+            min_worker_footprint = fixed_overhead_per_worker + min_profile_budget_mb
+            dev_workers = max(1, min(int(env_max_w_per_gpu), vram_usable_mb // max(1, min_worker_footprint)))
         dev_workers = min(dev_workers, max(1, total_tiles))
 
         # Dynamic profile budget per worker:
         vram_per_worker_mb = vram_usable_mb // dev_workers
         available_profile_mb = vram_per_worker_mb - fixed_overhead_per_worker
         # OpenCL single buffer constraint: cap to 85% of max_alloc_mb (typically ~2-4GB)
-        safe_max_alloc_mb = int(max_alloc_mb * 0.85) if max_alloc_mb else 2048
         profile_budget_mb = min(safe_max_alloc_mb, max(min_profile_budget_mb, available_profile_mb))
         if user_budget is not None:
             profile_budget_mb = user_budget

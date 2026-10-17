@@ -1055,8 +1055,9 @@ static void build_profile_cl(__global const short* surface, int surf_w, int surf
     int segments = imax(1, (int)ceil(dist_cells));
     elev[0] = (real_t)segments;
     elev[1] = dist / (real_t)segments;
+    real_t inv_segs = (real_t)1.0 / (real_t)segments;
     for (int i = 0; i <= segments; i++) {
-        real_t t = (real_t)i / (real_t)segments;
+        real_t t = (real_t)i * inv_segs;
         int col = imin(imax((int)round((real_t)tx_col + (real_t)dx * t), 0), surf_w - 1);
         int row = imin(imax((int)round((real_t)tx_row + (real_t)dy * t), 0), surf_h - 1);
         elev[i + 2] = (real_t)surface[(size_t)row * (size_t)surf_w + (size_t)col];
